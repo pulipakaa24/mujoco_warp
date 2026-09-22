@@ -1208,8 +1208,8 @@ def _ccd_grid_size(kernel, naconmax: int, device) -> int:
   # Grid-stride launch width for the CCD kernel: a few device waves, capped at the contact
   # capacity. The kernel strides over the actual candidate count, so we avoid launching one
   # (mostly idle) thread per naconmax slot.
-  if device.is_cpu:
-    # Warp forces CPU block_dim to 1 and has no CUDA occupancy information.
+  if not device.is_cuda:
+    # Warp forces block_dim to 1 on other backends, which have no CUDA occupancy information.
     return naconmax
 
   block_size, min_grid_size = wp.get_suggested_block_size(kernel, device)

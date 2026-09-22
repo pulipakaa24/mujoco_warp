@@ -359,6 +359,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   # warp only fields
   opt.broadphase = types.BroadphaseType.NXN
   opt.broadphase_filter = types.BroadphaseFilter.PLANE | types.BroadphaseFilter.SPHERE | types.BroadphaseFilter.OBB
+  # Conditional graph nodes only exist on CUDA; elsewhere the loop condition would be read back per iteration.
   opt.graph_conditional = True
   opt.run_collision_detection = True
   opt.warn_overflow = int(types.OverflowType.ALL)

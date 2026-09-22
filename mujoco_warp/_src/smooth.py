@@ -1302,7 +1302,7 @@ def _tile_cholesky_factorize_block(tile: TileSet):
     worldid, blk = wp.tid()
     start = block_dof[blk]
 
-    idx = wp.tile_load(block_elemid, shape=(block_area,), offset=(blk * block_area,), storage="shared")
+    idx = wp.tile_load(block_elemid, shape=(block_area,), offset=(blk * block_area,))  # register: each lane owns its gather indices
     block = wp.tile_load_indexed(M_in[worldid], idx, shape=(block_area,), storage="shared")
 
     L = wp.tile_reshape(block, (block_size, block_size))
@@ -3609,7 +3609,7 @@ def _tile_cholesky_factorize_solve_block(tile: TileSet):
     start = block_dof[blk]
 
     # Densify the block (see _tile_cholesky_factorize_block for the gather rationale).
-    idx = wp.tile_load(block_elemid, shape=(block_area,), offset=(blk * block_area,), storage="shared")
+    idx = wp.tile_load(block_elemid, shape=(block_area,), offset=(blk * block_area,))  # register: each lane owns its gather indices
     block = wp.tile_load_indexed(M_in[worldid], idx, shape=(block_area,), storage="shared")
 
     L = wp.tile_reshape(block, (block_size, block_size))

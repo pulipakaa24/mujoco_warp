@@ -2363,7 +2363,8 @@ def _update_gradient_JTDAJ_dense_tiled_compact(nv_pad: int, tile_size: int, njma
 
       J_ki = wp.tile_map(wp.mul, wp.tile_transpose(J_kj), wp.tile_broadcast(D_k, shape=(nv_pad, TILE_SIZE_K)))
 
-      sum_val += wp.tile_matmul(J_ki, J_kj)
+      # accumulate in place: the returning form allocates a second (nv_pad, nv_pad) shared tile
+      wp.tile_matmul(J_ki, J_kj, sum_val)
 
     wp.tile_store(ctx_h_out[worldid], sum_val, bounds_check=False)
 
@@ -2441,7 +2442,8 @@ def _update_gradient_JTDAJ_dense_tiled(nv_pad: int, tile_size: int, njmax: int, 
 
       J_ki = wp.tile_map(wp.mul, wp.tile_transpose(J_kj), wp.tile_broadcast(D_k, shape=(nv_pad, TILE_SIZE_K)))
 
-      sum_val += wp.tile_matmul(J_ki, J_kj)
+      # accumulate in place: the returning form allocates a second (nv_pad, nv_pad) shared tile
+      wp.tile_matmul(J_ki, J_kj, sum_val)
 
     wp.tile_store(ctx_h_out[worldid], sum_val, bounds_check=False)
 
@@ -2748,13 +2750,16 @@ def _cholesky_factorize_solve(
   If skip_unchanged is True (blocked path only), worlds where no constraints
   changed reuse the cached factorization in hfactor instead of refactorizing.
   """
-  if m.nv <= _BLOCK_CHOLESKY_DIM:
+  # Off CUDA the single dense tile beats the blocked factorization up to 64 DOFs (threadgroup memory,
+  # not FLOPs, limits occupancy there).
+  if m.nv <= (_BLOCK_CHOLESKY_DIM if wp.get_device().is_cuda else 64):
     wp.launch_tiled(
       _update_gradient_cholesky(m.nv, skip_noflip),
       dim=d.nworld,
       inputs=[ctx.grad, ctx.h, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
       outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
-      block_dim=m.block_dim.update_gradient_cholesky,
+      # one SIMD group per world keeps the factorization in registers off CUDA
+      block_dim=m.block_dim.update_gradient_cholesky if wp.get_device().is_cuda else 32,
     )
   else:
     wp.launch(
@@ -3130,7 +3135,8 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         groups_per_world,
       ]
       elliptic = m.opt.cone == types.ConeType.ELLIPTIC
-      threads_per_group = 1 if elliptic and wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP
+      # cooperative thread groups exist on CUDA only; other backends run one lane per block
+      threads_per_group = _JTDAJ_THREADS_PER_GROUP if not elliptic or wp.get_device().is_cuda else 1
       block_dim = threads_per_group if elliptic else mj.block_dim.update_gradient_JTDAJ_sparse
       wp.launch(
         jtdaj_kernel,
