@@ -212,6 +212,39 @@ def m_block_layout(mjm: mujoco.MjModel) -> dict:
   }
 
 
+
+def _flex_elemorder(mjm: mujoco.MjModel) -> np.ndarray:
+  """Rank of every flex element in the order MuJoCo C 3.14's midphase (mj_collideTree) visits the leaves of the
+  flex's BVH against a rigid geom leaf: a stack, children pushed in order, popped last-in-first-out. Used to
+  order a geom-flex contact group canonically before selecting MJ_MAXCONPAIR contacts (FLEX_FPS_MODE="c314")."""
+  order = np.zeros(mjm.nflexelem, dtype=np.int32)
+  for f in range(mjm.nflex):
+    adr, num = mjm.flex_bvhadr[f], mjm.flex_bvhnum[f]
+    elemadr, nelem = mjm.flex_elemadr[f], mjm.flex_elemnum[f]
+    if adr < 0 or num == 0:
+      order[elemadr : elemadr + nelem] = np.arange(nelem)
+      continue
+    child = mjm.bvh_child[adr : adr + num]
+    nodeid = mjm.bvh_nodeid[adr : adr + num]
+    rank, stack = 0, [0]
+    seen = np.zeros(nelem, bool)
+    while stack:
+      node = stack.pop()
+      c0, c1 = child[node]
+      if c0 < 0 and c1 < 0:
+        e = nodeid[node]
+        if 0 <= e < nelem and not seen[e]:
+          order[elemadr + e] = rank
+          seen[e] = True
+          rank += 1
+        continue
+      for c in (c0, c1):
+        if c != -1:
+          stack.append(c)
+    rest = np.where(~seen)[0]
+    order[elemadr + rest] = rank + np.arange(len(rest))
+  return order
+
 def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) -> types.Model:
   """Creates a model on device.
 
@@ -431,6 +464,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.is_sparse = is_sparse(mjm)
   m.has_fluid = bool(mjm.opt.wind.any() or mjm.opt.density > 0 or mjm.opt.viscosity > 0)
   m.nflexintcell = _get_nflexintcell(mjm)
+  m.flex_elemorder = _flex_elemorder(mjm)
 
   # Precompute flex_cell_map
   flex_cell_map = []

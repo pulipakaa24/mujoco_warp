@@ -1717,14 +1717,22 @@ class FlexCollisionTest(parameterized.TestCase):
       </worldbody>
     </mujoco>
     """
-    _, _, m, d = test_data.fixture(xml=xml, nworld=nworld)
+    mjm, mjd, m, d = test_data.fixture(xml=xml, nworld=nworld)
 
-    mjw.kinematics(m, d)
-    mjw.collision(m, d)
-
-    nacon = int(d.nacon.numpy()[0])
-    expected_contacts = 100 * nworld
-    self.assertEqual(nacon, expected_contacts, f"Expected {expected_contacts} contacts, got {nacon}")
+    # MuJoCo C caps every geom-flex pair at MJ_MAXCONPAIR (50 here, of 100 vertex contacts); with
+    # collision_flex.ENABLE_GEOM_FLEX_FPS (default) MuJoCo Warp does the same, without it all 100 are kept.
+    mujoco.mj_forward(mjm, mjd)
+    for fps, per_world in ((True, mjd.ncon), (False, 100)):
+      collision_flex.ENABLE_GEOM_FLEX_FPS = fps
+      try:
+        mjw.kinematics(m, d)
+        mjw.collision(m, d)
+      finally:
+        collision_flex.ENABLE_GEOM_FLEX_FPS = True
+      nacon = int(d.nacon.numpy()[0])
+      expected_contacts = per_world * nworld
+      self.assertEqual(nacon, expected_contacts, f"fps={fps}: expected {expected_contacts} contacts, got {nacon}")
+    self.assertEqual(mjd.ncon, 50)
 
   @parameterized.parameters(1, 2)
   def test_flex_fps_capping(self, nworld):
@@ -1818,8 +1826,11 @@ class FlexCollisionTest(parameterized.TestCase):
     np.testing.assert_allclose(pos_sat[idx_sat], pos_nosat[idx_nosat], atol=1e-5)
     np.testing.assert_allclose(dist_sat[idx_sat], dist_nosat[idx_nosat], atol=1e-5)
 
-  def test_parallel_fps_numpy_parity(self):
-    """Test that parallel FPS selects candidates matching a serial NumPy reference."""
+  @parameterized.parameters("parallel", "main", "c314")
+  def test_parallel_fps_numpy_parity(self, mode):
+    """Contact selection (FLEX_FPS_MODE) matches a serial NumPy reference of MuJoCo C's filter: deepest first,
+    then farthest from the selected set, ties to the first candidate in the group's sorted order, coincident
+    candidates allowed; "c314" adds MuJoCo C 3.14's swap of chosen contacts to the front."""
     _, _, m, d = test_data.fixture(
       xml="""
       <mujoco>
@@ -1844,82 +1855,62 @@ class FlexCollisionTest(parameterized.TestCase):
 
     mjw.kinematics(m, d)
 
-    ws = collision_flex._allocate_flex_workspace(m, d)
-    sap_data = collision_flex._run_flex_sap_sort(m, d)
-    ctx = collision_core.create_collision_context(d.naconmax)
-    collision_flex._flex_sap_collision(m, d, ctx, ws, is_self=False, sap_data=sap_data)
+    prev_mode = collision_flex.FLEX_FPS_MODE
+    collision_flex.FLEX_FPS_MODE = mode
+    try:
+      ws = collision_flex._allocate_flex_workspace(m, d)
+      sap_data = collision_flex._run_flex_sap_sort(m, d)
+      ctx = collision_core.create_collision_context(d.naconmax)
+      collision_flex._flex_sap_collision(m, d, ctx, ws, is_self=False, sap_data=sap_data)
+    finally:
+      collision_flex.FLEX_FPS_MODE = prev_mode
 
     ncand = int(ws.ncand.numpy()[0])
     cand_active = ws.cand_active.numpy()[:ncand]
     sort_val = ws.filter_val.numpy()[:ncand]
-    cand_active_sorted = ws.cand_active_sorted.numpy()[:ncand]
-    cand_pos = ws.pos.numpy()[:ncand]
-    cand_dist = ws.dist.numpy()[:ncand]
-    cand_elem = ws.elem.numpy()[:ncand]
+    cand_pos = ws.pos.numpy()[:ncand].astype(np.float64)
+    cand_dist = ws.dist.numpy()[:ncand].astype(np.float64)
     num_groups = int(ws.flex_num_groups.numpy()[0])
     group_starts = ws.flex_group_start_indices.numpy()[:num_groups]
 
-    def _tie_break(curr, sel):
-      if sel < 0:
-        return True
-      e1_c, e2_c = cand_elem[curr]
-      e1_s, e2_s = cand_elem[sel]
-      if e1_c != e1_s:
-        return e1_c < e1_s
-      if e2_c != e2_s:
-        return e2_c < e2_s
-      return curr < sel
-
     self.assertGreater(num_groups, 0)
+    checked = 0
     for g in range(num_groups):
       g_start = group_starts[g]
       g_end = group_starts[g + 1] if g + 1 < num_groups else ncand
-      group_cands = [sort_val[si] for si in range(g_start, g_end) if cand_active_sorted[si] == 1]
-      if len(group_cands) <= types.MJ_MAXCONPAIR:
+      cands = [int(sort_val[si]) for si in range(g_start, g_end)]  # canonical order
+      n = len(cands)
+      if n <= types.MJ_MAXCONPAIR:
         continue
-
-      best_seed = -1
-      min_d = 1e10
-      for c_idx in group_cands:
-        d_val = cand_dist[c_idx]
-        if d_val < min_d:
-          min_d = d_val
-          best_seed = c_idx
-        elif d_val == min_d and _tie_break(c_idx, best_seed):
-          min_d = d_val
-          best_seed = c_idx
-
-      selected = [best_seed]
-      seed_pos = cand_pos[best_seed]
-      min_dist = {c_idx: np.float32(np.linalg.norm(cand_pos[c_idx] - seed_pos)) for c_idx in group_cands}
-
-      for _ in range(1, types.MJ_MAXCONPAIR):
-        max_d = np.float32(-1e10)
-        best_cand = -1
-        for c_idx in group_cands:
-          if c_idx in selected:
+      checked += 1
+      slot = list(cands)
+      sel = [False] * n
+      mind = [np.inf] * n
+      best = int(np.argmax([-cand_dist[c] for c in slot]))  # first maximum
+      nsel = 0
+      chosen = []
+      while nsel < types.MJ_MAXCONPAIR and best >= 0:
+        sel[best] = True
+        chosen.append(slot[best])
+        bp = cand_pos[slot[best]]
+        nb, nbd = -1, -1.0
+        for k in range(n):
+          if sel[k]:
             continue
-          md = min_dist[c_idx]
-          if md > max_d:
-            max_d = md
-            best_cand = c_idx
-          elif md == max_d and _tie_break(c_idx, best_cand):
-            max_d = md
-            best_cand = c_idx
-
-        if best_cand < 0 or max_d <= 0.0:
-          break
-
-        selected.append(best_cand)
-        new_pos = cand_pos[best_cand]
-        for c_idx in group_cands:
-          d_new = np.float32(np.linalg.norm(cand_pos[c_idx] - new_pos))
-          if d_new < min_dist[c_idx]:
-            min_dist[c_idx] = d_new
-
-      warp_selected = sorted([c_idx for c_idx in group_cands if cand_active[c_idx] == 1])
-      np_selected = sorted(selected)
+          d2 = float(np.sum((cand_pos[slot[k]] - bp) ** 2))
+          mind[k] = min(mind[k], d2)
+          if mind[k] > nbd:
+            nbd, nb = mind[k], k
+        if mode == "c314" and nsel < types.MJ_MAXCONPAIR - 1:
+          slot[nsel], slot[best] = slot[best], slot[nsel]
+          if nb == nsel:
+            nb = best
+        nsel += 1
+        best = nb
+      np_selected = sorted(slot[:nsel]) if mode == "c314" else sorted(chosen)
+      warp_selected = sorted([c for c in cands if cand_active[c] == 1])
       self.assertEqual(warp_selected, np_selected)
+    self.assertGreater(checked, 0)
 
   @parameterized.parameters(1, 2)
   def test_mixed_flex_broadphase_and_narrowphase(self, nworld):
@@ -2701,14 +2692,17 @@ class FlexContactParityTest(parameterized.TestCase):
           c for c in self._get_sorted_contacts(d, d.nacon.numpy()[0], world_idx=w, is_warp=True) if c["geom"][0] >= 0
         ]
         m_geom_contacts = [c for c in self._get_sorted_contacts(mjd, mjd.ncon, is_warp=False) if c["geom"][0] >= 0]
-        if len(w_geom_contacts) == len(m_geom_contacts) and len(m_geom_contacts) > 0:
+        self.assertEqual(len(w_geom_contacts), len(m_geom_contacts), f"geom contact count at step {curr_step}")
+        # a capped group (MJ_MAXCONPAIR of a flat grid's equally deep vertices) is ill-conditioned: its selection
+        # follows float64 rounding of depths and grid distances in MuJoCo C, so only the count is compared
+        if 0 < len(m_geom_contacts) < types.MJ_MAXCONPAIR:
           self._assert_contact_parity(w_geom_contacts, m_geom_contacts, atol=1e-4)
 
       # Flex-flex contact count parity and constraint parity
       if curr_step in (0, 250, 500, 1000):
-        if curr_step == 250:
-          # MuJoCo caps contact pairs at mjMAXCONPAIR=50 (50 plane + 50 flex-flex = 100),
-          # whereas Warp detects all 64 vertices on the ground plane (64 + 50 = 114).
+        if curr_step == 250 and not collision_flex.ENABLE_GEOM_FLEX_FPS:
+          # MuJoCo caps contact pairs at mjMAXCONPAIR=50 (50 plane + 50 flex-flex = 100); without the geom-flex
+          # cap (ENABLE_GEOM_FLEX_FPS=False) Warp keeps all 64 vertices on the ground plane (64 + 50 = 114).
           self.assertEqual(d.nacon.numpy()[0], nworld * 114, f"nacon mismatch at step {curr_step}")
           for w in range(nworld):
             self.assertEqual(d.nefc.numpy()[w], 456, f"nefc mismatch at step {curr_step} (world {w})")
