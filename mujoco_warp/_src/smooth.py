@@ -1222,8 +1222,62 @@ def _qLDiag_div(
   D_out[worldid, dofid] = 1.0 / L_in[worldid, diag_i]
 
 
+@cache_kernel
+def _factor_i_sparse_serial(nlevels: int):
+  """Whole sparse L'*D*L factorization of one world per thread (Metal).
+
+  The level-parallel path launches one kernel per tree level (plus a copy and the diagonal): on
+  Metal every launch is a full GPU drain, and the levels of a single tree hold only a few updates
+  per world. Same updates in the same level order; updates of one level that hit the same row are
+  applied in list order instead of atomically in any order (float rounding only).
+  """
+  NLEVELS = nlevels
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    # In:
+    all_updates: wp.array[wp.vec3i],
+    level_offsets: wp.array[int],
+    M_in: wp.array2d[float],
+    # Out:
+    L_out: wp.array2d[float],
+    D_out: wp.array2d[float],
+  ):
+    worldid = wp.tid()
+    for e in range(M_in.shape[1]):
+      L_out[worldid, e] = M_in[worldid, e]
+    for level in range(wp.static(NLEVELS)):
+      level_idx = wp.static(NLEVELS) - 1 - level
+      for u in range(level_offsets[level_idx], level_offsets[level_idx + 1]):
+        update = all_updates[u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        Madr_i = M_rowadr[i]
+        rowadr_k = M_rowadr[k]
+        tmp = L_out[worldid, Madr_ki] / L_out[worldid, rowadr_k + M_rownnz[k] - 1]
+        for j in range(M_rownnz[i]):
+          L_out[worldid, Madr_i + j] = L_out[worldid, Madr_i + j] - L_out[worldid, rowadr_k + j] * tmp
+        L_out[worldid, Madr_ki] = tmp
+    for dofid in range(D_out.shape[1]):
+      D_out[worldid, dofid] = 1.0 / L_out[worldid, M_rowadr[dofid] + M_rownnz[dofid] - 1]
+
+  return kernel
+
+
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
+  if getattr(wp.get_device(), "is_metal", False):
+    wp.launch(
+      _factor_i_sparse_serial(len(m.qLD_updates)),
+      dim=d.nworld,
+      inputs=[m.M_rownnz, m.M_rowadr, m.qLD_all_updates, m.qLD_level_offsets, M],
+      outputs=[L, D],
+      block_dim=m.block_dim.sparse_ldl_serial,
+    )
+    return
+
   wp.copy(L, M)
 
   for i in reversed(range(len(m.qLD_updates))):
@@ -3406,6 +3460,51 @@ def _solve_LD_sparse_fused(nv: int, nlevels: int):
   return kernel
 
 
+@cache_kernel
+def _solve_LD_sparse_serial(nv: int, nlevels: int):
+  """_solve_LD_sparse_fused with one world per thread in full threadgroups (Metal).
+
+  Off CUDA the fused kernel runs one lane per world in one-thread threadgroups (1/32 of a SIMD
+  group). This is the same sequence of operations per world, so the result is unchanged bit for bit.
+  """
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    all_updates: wp.array[wp.vec3i],
+    level_offsets: wp.array[int],
+    y: wp.array2d[float],
+    # Out:
+    x_out: wp.array2d[float],
+  ):
+    worldid = wp.tid()
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    for dofid in range(NV):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, dofid] = y[worldid, dofid]
+    for level in range(NLEVELS):
+      level_idx = NLEVELS - 1 - level
+      for u in range(level_offsets[level_idx], level_offsets[level_idx + 1]):
+        update = all_updates[u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        x_out[worldid, i] = x_out[worldid, i] - L[worldid, Madr_ki] * x_out[worldid, k]
+    for dofid in range(NV):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, dofid] = x_out[worldid, dofid] * D[worldid, dofid]
+    for level in range(NLEVELS):
+      for u in range(level_offsets[level], level_offsets[level + 1]):
+        update = all_updates[u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        x_out[worldid, k] = x_out[worldid, k] - L[worldid, Madr_ki] * x_out[worldid, i]
+
+  return kernel
+
+
 def _solve_LD_sparse(
   m: Model,
   d: Data,
@@ -3416,6 +3515,15 @@ def _solve_LD_sparse(
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
   nlevels = len(m.qLD_updates)
+  if getattr(wp.get_device(), "is_metal", False):
+    wp.launch(
+      _solve_LD_sparse_serial(m.nv, nlevels),
+      dim=d.nworld,
+      inputs=[m.qLD_block_adr, L, D, m.qLD_all_updates, m.qLD_level_offsets, y],
+      outputs=[x],
+      block_dim=m.block_dim.sparse_ldl_serial,
+    )
+    return
   if wp.get_device().is_cuda:
     dim_block = m.block_dim.solve_LD_sparse_fused
   else:

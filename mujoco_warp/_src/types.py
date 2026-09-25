@@ -69,6 +69,8 @@ class BlockDim:
     cholesky_solve: Cholesky solve block dimension (smooth)
     small_cholesky: scalar small-block Cholesky block dimension (smooth)
     solve_LD_sparse_fused: solve LD sparse fused block dimension (smooth)
+    sparse_ldl_serial: threads (worlds) per threadgroup of the one-world-per-thread sparse L'DL
+      factor and solve used on Metal (smooth)
     update_gradient_cholesky: update gradient Cholesky block dimension (solver)
     update_gradient_cholesky_blocked: update gradient Cholesky blocked block dimension (solver)
     update_gradient_JTDAJ_sparse: update gradient JTDAJ sparse block dimension (solver)
@@ -102,6 +104,7 @@ class BlockDim:
   cholesky_solve: int = 64
   small_cholesky: int = 64
   solve_LD_sparse_fused: int = 128
+  sparse_ldl_serial: int = 32
   # solver
   update_gradient_cholesky: int = 64
   update_gradient_cholesky_blocked: int = 32
@@ -1443,6 +1446,8 @@ class Model:
     qLD_block_adr: packed factor offset; Q_LD_BLOCK_* sentinel otherwise (nv,)
     flg_adhesion: flag indicating if model has passive adhesion
     has_fluid: True if wind, density, or viscosity are non-zero at put_model time
+    has_gravcomp: True if any body has gravity compensation at put_model time, or body_gravcomp is
+      batched per world (the gravity-compensation launch is skipped otherwise, as MuJoCo C does)
     flg_surfacevel: whether model has non-zero surfacevel
     has_sdf_geom: whether the model contains SDF geoms
     has_flex_selfcollide: whether any flex has self-collision enabled
@@ -1943,6 +1948,7 @@ class Model:
   qLD_block_adr: array("nv", int)
   flg_adhesion: bool
   has_fluid: bool
+  has_gravcomp: bool
   flg_surfacevel: bool
   has_sdf_geom: bool
   has_flex_selfcollide: bool

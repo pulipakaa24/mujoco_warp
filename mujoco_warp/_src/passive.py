@@ -1407,7 +1407,8 @@ def passive(m: Model, d: Data):
 
   gravity_enabled = not (m.opt.disableflags & DisableBit.GRAVITY)
   d.qfrc_gravcomp.zero_()
-  if gravity_enabled:
+  # (nworld, nbody - 1, nv) threads that write nothing when no body has gravcomp (MuJoCo C: ngravcomp)
+  if gravity_enabled and m.has_gravcomp:
     wp.launch(
       _gravity_force,
       dim=(d.nworld, m.nbody - 1, m.nv),
