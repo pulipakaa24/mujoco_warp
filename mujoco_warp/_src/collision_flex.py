@@ -3151,11 +3151,14 @@ def _allocate_flex_workspace(m: Model, d: Data) -> FlexWorkspace:
     flex_group_start_indices = wp.full(nmax_groups, -1, dtype=int)
     flex_fps_min_dist = wp.empty(d.naconmax, dtype=float)
     flex_num_groups = wp.zeros(1, dtype=int)
-    fps_scratch_dist = wp.empty((nmax_groups, _FPS_BLOCK_SIZE), dtype=float)
-    fps_scratch_cidx = wp.empty((nmax_groups, _FPS_BLOCK_SIZE), dtype=int)
-    fps_scratch_count = wp.empty((nmax_groups, _FPS_BLOCK_SIZE), dtype=int)
-    fps_selected_cidx = wp.full(nmax_groups, -1, dtype=int)
-    fps_selected_pos = wp.empty(nmax_groups, dtype=wp.vec3)
+    # block-parallel FPS scratch (nmax_groups x 64 per array: ~0.7 GB at 4096 worlds of a 10x10 cloth); the serial
+    # modes need none of it
+    ngs = nmax_groups if FLEX_FPS_MODE == "parallel" else 1
+    fps_scratch_dist = wp.empty((ngs, _FPS_BLOCK_SIZE), dtype=float)
+    fps_scratch_cidx = wp.empty((ngs, _FPS_BLOCK_SIZE), dtype=int)
+    fps_scratch_count = wp.empty((ngs, _FPS_BLOCK_SIZE), dtype=int)
+    fps_selected_cidx = wp.full(ngs, -1, dtype=int)
+    fps_selected_pos = wp.empty(ngs, dtype=wp.vec3)
     fps_groups_active = wp.zeros(1, dtype=int)
     fps_condition = wp.zeros(1, dtype=int)
     fps_iter = wp.zeros(1, dtype=int)
