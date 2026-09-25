@@ -1561,6 +1561,7 @@ class Model:
     nflexface: number of interpolated flex shell faces
     flex_face_map: mapping of face index to flex and local element face indices
     flex_face: global node indices of each face                             (nflexface, 9)
+    flex_elemorder: element rank in MuJoCo C 3.14's midphase (nflexelem,)
   """
 
   nq: int
@@ -2055,6 +2056,7 @@ class Model:
   nflexface: int
   flex_face_map: array("nflexface", wp.vec2i)
   flex_face: array("nflexface", 9, int)
+  flex_elemorder: array("nflexelem", int)  # element rank in MuJoCo C 3.14's midphase order (contact filter)
 
 
 class ContactType(enum.IntFlag):
