@@ -15,6 +15,8 @@
 
 from typing import Tuple
 
+import os
+
 import warp as wp
 
 from mujoco_warp._src.collision_core import CollisionContext
@@ -48,6 +50,11 @@ from mujoco_warp._src.warp_util import event_scope
 wp.set_module_options({"enable_backward": False})
 
 
+# MJW_PLANE_CONVEX=legacy (read at import) restores the previous 4-point heuristic for every convex geom
+# (MetalSim A/B comparisons); default: MuJoCo C's contact set for meshes with polygon data.
+PLANE_CONVEX_LEGACY = os.environ.get("MJW_PLANE_CONVEX", "c").lower() == "legacy"
+
+
 @wp.func
 def _plane_convex_area4(
   vert: wp.array[wp.vec3], vertadr: int, polyvert: wp.array[int], fadr: int, a: int, b: int, c: int, d: int
@@ -73,7 +80,7 @@ def plane_convex(
   reported with their distance and dropped by write_contact. Meshes without polygon data fall back
   to the 4-point heuristic (_plane_convex_heuristic).
   """
-  if convex.mesh_polynum <= 0:
+  if wp.static(PLANE_CONVEX_LEGACY) or convex.mesh_polynum <= 0:
     return _plane_convex_heuristic(plane_normal, plane_pos, convex, margin)
 
   contact_dist = wp.vec4(MJ_MAXVAL)
