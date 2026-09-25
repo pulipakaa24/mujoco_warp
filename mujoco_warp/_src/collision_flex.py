@@ -70,6 +70,11 @@ MESH_FLEX_FACE_NORMAL: bool = False
 # filter / SAP sorts and scans on the device (bitonic per world, two-level scan) instead of Warp's utilities, which
 # run on the host on Metal. None: on everywhere except CUDA (whose utilities are device sorts already)
 FLEX_DEVICE_SORT: bool | None = None
+# contacts kept per (body, flex) or (flex, flex) pair by the serial selection modes. MuJoCo C: mjMAXCONPAIR = 50 (a
+# compile-time constant), which is too few for large cloths: a 1 m, 33 x 33 cloth draped over a 0.4 m box needs ~80
+# contacts at rest and ~290 at impact, and with 50 it sinks through the box in MuJoCo C itself (measured). Raise for
+# such scenes; the default keeps MuJoCo C parity. Not used by FLEX_FPS_MODE="parallel".
+FLEX_MAXCONPAIR: int = MJ_MAXCONPAIR
 
 
 def _device_sort() -> bool:
@@ -3232,7 +3237,7 @@ def _allocate_flex_workspace(m: Model, d: Data) -> FlexWorkspace:
 
 
 @cache_kernel
-def _serial_fps(c314: bool):
+def _serial_fps(c314: bool, maxcon: int = MJ_MAXCONPAIR):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # In:
@@ -3262,7 +3267,7 @@ def _serial_fps(c314: bool):
     if g < flex_num_groups_in[0] - 1:
       g_end = wp.min(ncand_limit, flex_group_start_indices_in[g + 1])
     n = g_end - g_start
-    if n <= MJ_MAXCONPAIR:
+    if n <= wp.static(maxcon):
       return  # all stay active
 
     for k in range(n):
@@ -3281,7 +3286,7 @@ def _serial_fps(c314: bool):
         best = k
 
     nselected = int(0)
-    while nselected < MJ_MAXCONPAIR and best >= 0:
+    while nselected < wp.static(maxcon) and best >= 0:
       slot_sel[g_start + best] = 1
       bestpos = cand_pos[slot_cand[g_start + best]]
       nextbest = int(-1)
@@ -3300,7 +3305,7 @@ def _serial_fps(c314: bool):
           nextbest = k
       if wp.static(c314):
         # MuJoCo C 3.14 moves the chosen contact to the front (contacts only, not selected/min_dist)
-        if nselected < MJ_MAXCONPAIR - 1:
+        if nselected < wp.static(maxcon - 1):
           tmp = slot_cand[g_start + nselected]
           slot_cand[g_start + nselected] = slot_cand[g_start + best]
           slot_cand[g_start + best] = tmp
@@ -3763,7 +3768,7 @@ def _filter_and_write_contacts(
       _run_filter_flex_fps(m, d, ws, nmax_groups)
     else:
       wp.launch(
-        _serial_fps(FLEX_FPS_MODE == "c314"),
+        _serial_fps(FLEX_FPS_MODE == "c314", int(FLEX_MAXCONPAIR)),
         dim=nmax_groups,
         inputs=[
           ws.flex_group_start_indices,

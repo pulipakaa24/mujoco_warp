@@ -3713,3 +3713,27 @@ class FlexImplicitDampingTest(parameterized.TestCase):
     self.assertTrue(np.isfinite(x_i).all())
     self.assertLess(np.abs(v_i).max(), 20.0)
     self.assertLess(x_i[:, 2].min(), 0.95)
+
+
+class FlexMaxConPairTest(parameterized.TestCase):
+  """collision_flex.FLEX_MAXCONPAIR: per-pair flex contact cap (MuJoCo C: mjMAXCONPAIR = 50)."""
+
+  def test_cap_raised(self):
+    xml = """
+    <mujoco><worldbody><geom type="plane" size="2 2 0.1"/>
+      <flexcomp name="cloth" type="grid" count="11 11 1" spacing="0.05 0.05 0.05" pos="0 0 0.004" dim="2" radius="0.005" mass="1">
+        <edge equality="true"/><contact selfcollide="none"/></flexcomp></worldbody></mujoco>"""
+    counts = {}
+    prev = collision_flex.FLEX_MAXCONPAIR
+    try:
+      for cap in (types.MJ_MAXCONPAIR, 400):
+        collision_flex.FLEX_MAXCONPAIR = cap
+        mjm, mjd, m, d = test_data.fixture(xml=xml, nconmax=500)
+        mjw.kinematics(m, d)
+        mjw.collision(m, d)
+        counts[cap] = int(d.nacon.numpy()[0])
+    finally:
+      collision_flex.FLEX_MAXCONPAIR = prev
+    mujoco.mj_forward(mjm, mjd)
+    self.assertEqual(counts[types.MJ_MAXCONPAIR], mjd.ncon)  # 50, as MuJoCo C
+    self.assertEqual(counts[400], 121)  # every vertex
