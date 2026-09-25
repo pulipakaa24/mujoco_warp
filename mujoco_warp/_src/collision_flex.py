@@ -63,6 +63,8 @@ CABLE_CAPSULE_ELEMENTS: bool = True
 FPS_COINCIDENT_D2: float = 1.0e-12
 # mesh-element contact point at the midpoint of the radius-inflated penetration (MuJoCo C); False: upstream's midpoint
 FLEX_RADIUS_CONTACT_POS: bool = True
+# volume flexes: only active-layer elements collide with geoms (MuJoCo C's flex BVH holds only those)
+FLEX_ACTIVE_LAYERS_ONLY: bool = True
 # depth (m) and relative squared-distance differences treated as ties in the selection (float32 vs MuJoCo C's float64)
 FPS_DEPTH_TIE: float = 1.0e-8
 FPS_DIST_REL_TIE: float = 1.0e-6
@@ -1897,6 +1899,8 @@ def _flex_narrowphase_elem_detect(warn_overflow: int):
     flex_dim: wp.array[int],
     flex_vertadr: wp.array[int],
     flex_elemadr: wp.array[int],
+    flex_activelayers: wp.array[int],
+    flex_elemlayer: wp.array[int],
     flex_elemdataadr: wp.array[int],
     flex_vertbodyid: wp.array[int],
     flex_elem: wp.array[int],
@@ -1956,6 +1960,10 @@ def _flex_narrowphase_elem_detect(warn_overflow: int):
     elem_radius = flex_radius[flexid]
     elem_margin = flex_margin[flexid]
     local_elemid = elemid - flex_elemadr[flexid]
+    # MuJoCo C builds a flex's BVH from its active elements only (surface layers of a volume, flex_activelayers),
+    # so geom contacts involve only those
+    if wp.static(FLEX_ACTIVE_LAYERS_ONLY) and not _elem_active(flex_activelayers, flex_dim, flex_elemadr, flex_elemlayer, flexid, local_elemid):
+      return
 
     geom2 = Geom()
     geom2.pos = wp.vec3(0.0, 0.0, 0.0)
@@ -3735,6 +3743,8 @@ def _detect_elem_geom_candidates(
       m.flex_dim,
       m.flex_vertadr,
       m.flex_elemadr,
+      m.flex_activelayers,
+      m.flex_elemlayer,
       m.flex_elemdataadr,
       m.flex_vertbodyid,
       m.flex_elem,
