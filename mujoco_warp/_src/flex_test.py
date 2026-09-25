@@ -3670,3 +3670,46 @@ class FlexContactNnzTest(parameterized.TestCase):
 if __name__ == "__main__":
   wp.init()
   absltest.main()
+
+
+class FlexImplicitDampingTest(parameterized.TestCase):
+  """flex_damping.ENABLE: backward-Euler elasticity damping."""
+
+  _XML = """
+    <mujoco><option timestep="0.0005" solver="CG" iterations="50" ls_iterations="20" jacobian="sparse"/>
+      <worldbody>
+        <flexcomp name="rod" type="grid" count="11 2 2" spacing="0.05 0.02 0.02" pos="0.25 0 1" dim="3" radius="0.001" mass="0.2">
+          <pin grid="0 0 0 0 0 1 0 1 0 0 1 1"/>
+          <elasticity young="1e5" poisson="0.4" damping="{damping}"/>
+          <contact selfcollide="none"/>
+        </flexcomp>
+      </worldbody>
+    </mujoco>"""
+
+  def _run(self, damping, implicit, nsteps):
+    from mujoco_warp._src import flex_damping
+
+    prev = flex_damping.ENABLE
+    flex_damping.ENABLE = implicit
+    try:
+      mjm, mjd, m, d = test_data.fixture(xml=self._XML.format(damping=damping))
+      for _ in range(nsteps):
+        mjw.step(m, d)
+      return mjm, d.flexvert_xpos.numpy()[0], d.qvel.numpy()[0]
+    finally:
+      flex_damping.ENABLE = prev
+
+  def test_small_damping_matches_explicit(self):
+    # damping * dt * omega^2 << 1: implicit and explicit agree to O(dt) (measured 2e-5 m after 0.5 s)
+    _, x_e, _ = self._run(3e-5, False, 200)
+    _, x_i, _ = self._run(3e-5, True, 200)
+    np.testing.assert_allclose(x_i, x_e, atol=1e-5)
+
+  def test_large_damping_stable(self):
+    # explicit damping 5e-3 diverges within ~30 steps at 0.5 ms; implicit stays finite and hangs down
+    mjm, x_e, _ = self._run(5e-3, False, 400)
+    self.assertFalse(np.isfinite(x_e).all() and np.abs(x_e).max() < 10.0)
+    _, x_i, v_i = self._run(5e-3, True, 400)
+    self.assertTrue(np.isfinite(x_i).all())
+    self.assertLess(np.abs(v_i).max(), 20.0)
+    self.assertLess(x_i[:, 2].min(), 0.95)

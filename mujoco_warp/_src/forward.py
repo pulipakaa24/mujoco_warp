@@ -17,6 +17,8 @@ from typing import Optional
 
 import warp as wp
 
+from mujoco_warp._src import flex_damping
+
 from mujoco_warp._src import collision_driver
 from mujoco_warp._src import constraint
 from mujoco_warp._src import derivative
@@ -1825,6 +1827,8 @@ def step(m: Model, d: Data):
   forward(m, d)
 
   if m.opt.integrator == IntegratorType.EULER:
+    if flex_damping.active(m):
+      flex_damping.apply(m, d)
     euler(m, d)
   elif m.opt.integrator == IntegratorType.RK4:
     rungekutta4(m, d)

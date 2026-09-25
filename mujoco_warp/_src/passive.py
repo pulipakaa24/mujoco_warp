@@ -15,6 +15,8 @@
 
 import warp as wp
 
+from mujoco_warp._src import flex_damping
+
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
@@ -1347,7 +1349,7 @@ def passive(m: Model, d: Data):
         d.flexvert_xpos,
         d.flexedge_length,
         d.flexedge_velocity,
-        dsbl_damper,
+        dsbl_damper or flex_damping.active(m),   # implicit instead (flex_damping.py)
       ],
       outputs=[flex_spring_body_force],
     )

@@ -1214,6 +1214,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       setattr(m, f.name, _create_array(getattr(m, f.name), f.type, sizes, batch_size))
 
   warp_util.mark_batched(m)
+  from mujoco_warp._src import flex_damping  # noqa: PLC0415
+
+  flex_damping.attach(m, mjm)
   return m
 
 
