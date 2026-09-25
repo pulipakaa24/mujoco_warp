@@ -77,6 +77,7 @@ def _device_sort() -> bool:
     return bool(FLEX_DEVICE_SORT)
   return not wp.get_device().is_cuda
 MESH_FLEX_FACE_NORMAL_COS: float = 0.99995  # ~0.01 rad
+MESH_FLEX_NORMAL_MIN_SEP: float = 1.0e-4  # m, witness separation below which the direction is unreliable in float32
 # depth (m) and relative squared-distance differences treated as ties in the selection (float32 vs MuJoCo C's float64)
 FPS_DEPTH_TIE: float = 1.0e-8
 FPS_DIST_REL_TIE: float = 1.0e-6
@@ -804,7 +805,11 @@ def _collide_mesh_convex(
       if not wp.static(MESH_FLEX_FACE_NORMAL):
         # MuJoCo C uses the penetration (EPA) direction. Keep the face normal only where it is that direction up to
         # float32 EPA error (face contacts); at edges and corners use the EPA direction.
-        if wp.abs(wp.dot(normal, gjk_normal)) < wp.static(MESH_FLEX_FACE_NORMAL_COS):
+        # (the EPA/GJK direction is noise when the witness points nearly coincide: a touching contact, |w1-w2|
+        # below 1e-4 m; there the face normal stays, as upstream)
+        if wp.abs(wp.dot(normal, gjk_normal)) < wp.static(MESH_FLEX_FACE_NORMAL_COS) and wp.length(diff) > wp.static(
+          MESH_FLEX_NORMAL_MIN_SEP
+        ):
           normal = gjk_normal
       contact_pos = 0.5 * (w1 + w2)
       if wp.static(FLEX_RADIUS_CONTACT_POS):
