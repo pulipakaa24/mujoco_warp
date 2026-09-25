@@ -65,6 +65,9 @@ FPS_COINCIDENT_D2: float = 1.0e-12
 FLEX_RADIUS_CONTACT_POS: bool = True
 # volume flexes: only active-layer elements collide with geoms (MuJoCo C's flex BVH holds only those)
 FLEX_ACTIVE_LAYERS_ONLY: bool = True
+# mesh-flex contact normal snapped to the nearest mesh face (upstream) instead of MuJoCo C's EPA direction
+MESH_FLEX_FACE_NORMAL: bool = False
+MESH_FLEX_FACE_NORMAL_COS: float = 0.99995  # ~0.01 rad
 # depth (m) and relative squared-distance differences treated as ties in the selection (float32 vs MuJoCo C's float64)
 FPS_DEPTH_TIE: float = 1.0e-8
 FPS_DIST_REL_TIE: float = 1.0e-6
@@ -789,6 +792,11 @@ def _collide_mesh_convex(
             best_normal = wp.normalize(geom_rot @ best_normal_local)
 
       normal = wp.where(wp.dot(best_normal, gjk_normal) >= 0.0, best_normal, -best_normal)
+      if not wp.static(MESH_FLEX_FACE_NORMAL):
+        # MuJoCo C uses the penetration (EPA) direction. Keep the face normal only where it is that direction up to
+        # float32 EPA error (face contacts); at edges and corners use the EPA direction.
+        if wp.abs(wp.dot(normal, gjk_normal)) < wp.static(MESH_FLEX_FACE_NORMAL_COS):
+          normal = gjk_normal
       contact_pos = 0.5 * (w1 + w2)
       if wp.static(FLEX_RADIUS_CONTACT_POS):
         # MuJoCo C inflates the element by its radius inside the CCD object: the contact point is the midpoint of
