@@ -2521,6 +2521,24 @@ def _get_contact_bodies_and_weights(
   # Element contact: Retrieve local vertices
   dim = flex_dim[flex_id]
 
+  if dim == 1:
+    # capsule element (cable) contact: inverse-distance weights over its two vertices, as for triangles
+    elem_data_start = flex_elemdataadr[flex_id] + elem_id * 2
+    v0 = flex_elem[elem_data_start + 0]
+    v1 = flex_elem[elem_data_start + 1]
+
+    x0 = flexvert_xpos_in[worldid, flex_vert_start + v0]
+    x1 = flexvert_xpos_in[worldid, flex_vert_start + v1]
+
+    w0 = 1.0 / wp.max(types.MJ_MINVAL, wp.length(con_pos - x0))
+    w1 = 1.0 / wp.max(types.MJ_MINVAL, wp.length(con_pos - x1))
+    w_sum = w0 + w1
+
+    b0 = flex_vertbodyid[flex_vert_start + v0]
+    b1 = flex_vertbodyid[flex_vert_start + v1]
+
+    return wp.vec4i(b0, b1, -1, -1), wp.vec4(w0 / w_sum, w1 / w_sum, 0.0, 0.0)
+
   if dim == 2:
     elem_data_start = flex_elemdataadr[flex_id] + elem_id * 3
     v0 = flex_elem[elem_data_start + 0]

@@ -1083,23 +1083,23 @@ class FlexCollisionTest(parameterized.TestCase):
     mujoco.mj_flex(mjm, mjd)
     mujoco.mj_collision(mjm, mjd)
 
-    # Warp only detects vertex collision (1 contact per world)
-    self.assertEqual(d.nacon.numpy()[0], nworld * 1)
-    # MuJoCo detects edge collisions (2 contacts)
+    # MuJoCo C collides the rope's capsule elements (mj_collideGeomElem -> mjraw_SphereCapsule): 2 contacts;
+    # so does Warp with collision_flex.CABLE_CAPSULE_ELEMENTS (upstream: 1 vertex contact, vertex 3)
     self.assertEqual(mjd.ncon, 2)
-
+    self.assertEqual(d.nacon.numpy()[0], nworld * mjd.ncon)
+    ref = sorted((int(c.elem[1]), tuple(np.round(c.pos, 5)), round(float(c.dist), 6)) for c in mjd.contact[: mjd.ncon])
+    n = d.nacon.numpy()[0]
+    wid = d.contact.worldid.numpy()[:n]
     for w in range(nworld):
-      contacts_worldid = d.contact.worldid.numpy()[: d.nacon.numpy()[0]]
-      w_indices = np.where(contacts_worldid == w)[0]
-      self.assertEqual(len(w_indices), 1)
-      idx = w_indices[0]
-      # Verify it is vertex 3 contact
-      self.assertEqual(int(d.contact.geom.numpy()[idx, 0]), 0)
-      self.assertEqual(int(d.contact.geom.numpy()[idx, 1]), -1)
-      self.assertEqual(int(d.contact.flex.numpy()[idx, 0]), -1)
-      self.assertEqual(int(d.contact.flex.numpy()[idx, 1]), 0)
-      self.assertEqual(int(d.contact.elem.numpy()[idx, 1]), -1)
-      self.assertEqual(int(d.contact.vert.numpy()[idx, 1]), 3)
+      idx = np.where(wid == w)[0]
+      got = sorted(
+        (int(d.contact.elem.numpy()[i, 1]), tuple(np.round(d.contact.pos.numpy()[i], 5)), round(float(d.contact.dist.numpy()[i]), 6))
+        for i in idx
+      )
+      self.assertEqual([g[0] for g in got], [r[0] for r in ref])
+      np.testing.assert_allclose([g[1] for g in got], [r[1] for r in ref], atol=1e-5)
+      np.testing.assert_allclose([g[2] for g in got], [r[2] for r in ref], atol=1e-5)
+      self.assertTrue(np.all(d.contact.vert.numpy()[idx, 1] == -1))
 
   @parameterized.parameters(1, 2)
   def test_mesh_rope_collision(self, nworld):
@@ -1875,6 +1875,12 @@ class FlexCollisionTest(parameterized.TestCase):
 
     self.assertGreater(num_groups, 0)
     checked = 0
+    # the serial modes treat float32-level differences as ties; the parallel mode compares exactly
+    tie_depth, tie_rel, tie_d2 = (
+      (0.0, 0.0, 0.0)
+      if mode == "parallel"
+      else (collision_flex.FPS_DEPTH_TIE, collision_flex.FPS_DIST_REL_TIE, collision_flex.FPS_COINCIDENT_D2)
+    )
     for g in range(num_groups):
       g_start = group_starts[g]
       g_end = group_starts[g + 1] if g + 1 < num_groups else ncand
@@ -1886,7 +1892,10 @@ class FlexCollisionTest(parameterized.TestCase):
       slot = list(cands)
       sel = [False] * n
       mind = [np.inf] * n
-      best = int(np.argmax([-cand_dist[c] for c in slot]))  # first maximum
+      best = 0  # first maximum (depth ties within FPS_DEPTH_TIE)
+      for k in range(1, n):
+        if -cand_dist[slot[k]] > -cand_dist[slot[best]] + tie_depth:
+          best = k
       nsel = 0
       chosen = []
       while nsel < types.MJ_MAXCONPAIR and best >= 0:
@@ -1898,8 +1907,10 @@ class FlexCollisionTest(parameterized.TestCase):
           if sel[k]:
             continue
           d2 = float(np.sum((cand_pos[slot[k]] - bp) ** 2))
+          if d2 < tie_d2:
+            d2 = 0.0
           mind[k] = min(mind[k], d2)
-          if mind[k] > nbd:
+          if mind[k] > nbd * (1.0 + tie_rel) + tie_d2:
             nbd, nb = mind[k], k
         if mode == "c314" and nsel < types.MJ_MAXCONPAIR - 1:
           slot[nsel], slot[best] = slot[best], slot[nsel]
