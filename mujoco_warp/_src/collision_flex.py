@@ -64,8 +64,8 @@ FPS_COINCIDENT_D2: float = 1.0e-12
 # mesh-element contact point at the midpoint of the radius-inflated penetration (MuJoCo C); False: upstream's midpoint
 FLEX_RADIUS_CONTACT_POS: bool = True
 # depth (m) and relative squared-distance differences treated as ties in the selection (float32 vs MuJoCo C's float64)
-FPS_DEPTH_TIE: float = 1.0e-7
-FPS_DIST_REL_TIE: float = 1.0e-5
+FPS_DEPTH_TIE: float = 1.0e-8
+FPS_DIST_REL_TIE: float = 1.0e-6
 
 
 @wp.func
