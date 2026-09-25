@@ -2618,6 +2618,9 @@ def _update_gradient_cholesky(tile_size: int, skip_noflip: bool = False):
 # Every launch is a full GPU drain on Metal, and the update ran as a separate (nworld, nv*(nv+1)/2) grid that
 # mostly exits early; here the world's 32 lanes apply it (same arithmetic per element) before factoring.
 _METAL_FUSE_H_CHOLESKY = os.environ.get("MJW_METAL_FUSE_H_CHOLESKY", "1") != "0"
+# Off CUDA, Newton Hessians up to this size use the single dense (register) tile Cholesky, larger ones the
+# blocked factorization (MJW_METAL_DENSE_CHOL_MAX overrides, for A/B measurements)
+_DENSE_CHOL_MAX_OFF_CUDA = int(os.environ.get("MJW_METAL_DENSE_CHOL_MAX", "64"))
 
 
 def _fuse_h_cholesky() -> bool:
@@ -2837,7 +2840,7 @@ def _cholesky_factorize_solve(
   """
   # Off CUDA the single dense tile beats the blocked factorization up to 64 DOFs (threadgroup memory,
   # not FLOPs, limits occupancy there).
-  if m.nv <= (_BLOCK_CHOLESKY_DIM if wp.get_device().is_cuda else 64):
+  if m.nv <= (_BLOCK_CHOLESKY_DIM if wp.get_device().is_cuda else _DENSE_CHOL_MAX_OFF_CUDA):
     wp.launch_tiled(
       _update_gradient_cholesky(m.nv, skip_noflip),
       dim=d.nworld,
@@ -3361,7 +3364,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
       ],
       outputs=[ctx.h],
     )
-  elif _fuse_h_cholesky() and m.nv <= 64:
+  elif _fuse_h_cholesky() and m.nv <= _DENSE_CHOL_MAX_OFF_CUDA:
     wp.launch_tiled(
       _update_gradient_h_incremental_cholesky(m.nv, stable_fast),
       dim=d.nworld,
