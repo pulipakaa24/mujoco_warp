@@ -868,6 +868,35 @@ def _equality_tendon(is_sparse: bool, newton: bool):
   return kernel
 
 
+@wp.kernel(module="unique", enable_backward=False)
+def _equality_flex_reserve(
+  # Model:
+  flex_interp: wp.array[int],
+  flex_edgenum: wp.array[int],
+  eq_obj1id: wp.array[int],
+  eq_flex_adr: wp.array[int],
+  # Data in:
+  eq_active_in: wp.array2d[bool],
+  # Data out:
+  ne_out: wp.array[int],
+  nefc_out: wp.array[int],
+  efc_jtdaj_nblock_out: wp.array[int],
+  # Out:
+  efc_base_out: wp.array[int],
+  jtdaj_base_out: wp.array[int],
+):
+  """Reserve one block of constraint rows per world for all flex edge equalities (see _equality_flex)."""
+  worldid = wp.tid()
+  total = int(0)
+  for i in range(eq_flex_adr.shape[0]):
+    eqid = eq_flex_adr[i]
+    if eq_active_in[worldid, eqid] and flex_interp[eq_obj1id[eqid]] == 0:
+      total += flex_edgenum[eq_obj1id[eqid]]
+  efc_base_out[worldid] = wp.atomic_add(nefc_out, worldid, total)
+  wp.atomic_add(ne_out, worldid, total)
+  jtdaj_base_out[worldid] = wp.atomic_add(efc_jtdaj_nblock_out, worldid, total)
+
+
 @cache_kernel
 def _equality_flex(is_sparse: bool, newton: bool):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
@@ -895,6 +924,8 @@ def _equality_flex(is_sparse: bool, newton: bool):
     flexedge_length_in: wp.array2d[float],
     njmax_in: int,
     njmax_nnz_in: int,
+    efc_base_in: wp.array[int],
+    jtdaj_base_in: wp.array[int],
     # Data out:
     ne_out: wp.array[int],
     nefc_out: wp.array[int],
@@ -931,14 +962,21 @@ def _equality_flex(is_sparse: bool, newton: bool):
     if edgeid < flex_edgeadr[flexid] or edgeid >= flex_edgeadr[flexid] + flex_edgenum[flexid]:
       return
 
-    wp.atomic_add(ne_out, worldid, 1)
-    efcid = wp.atomic_add(nefc_out, worldid, 1)
+    # rows in MuJoCo C's order (equality, then edge), reserved per world by _equality_flex_reserve: deterministic on
+    # every device (the atomic counter gave a device-dependent order: Metal's differs from CUDA's)
+    local = int(0)
+    for i in range(eqflexid):
+      eqid_i = eq_flex_adr[i]
+      if eq_active_in[worldid, eqid_i] and flex_interp[eq_obj1id[eqid_i]] == 0:
+        local += flex_edgenum[eq_obj1id[eqid_i]]
+    local += edgeid - flex_edgeadr[flexid]
+    efcid = efc_base_in[worldid] + local
 
     if efcid >= njmax_in:
       return
 
     if wp.static(is_sparse and newton):
-      jgid = wp.atomic_add(efc_jtdaj_nblock_out, worldid, 1)
+      jgid = jtdaj_base_in[worldid] + local
       efc_jtdaj_adr_out[worldid, jgid] = efcid
       efc_jtdaj_nrow_out[worldid, jgid] = 1
 
@@ -5185,6 +5223,14 @@ def make_constraint(m: types.Model, d: types.Data):
       )
 
       if m.nflex > 0:
+        efc_base = wp.empty(d.nworld, dtype=int)
+        jtdaj_base = wp.empty(d.nworld, dtype=int)
+        wp.launch(
+          _equality_flex_reserve,
+          dim=d.nworld,
+          inputs=[m.flex_interp, m.flex_edgenum, m.eq_obj1id, m.eq_flex_adr, d.eq_active],
+          outputs=[d.ne, d.nefc, d.efc.jtdaj_nblock, efc_base, jtdaj_base],
+        )
         wp.launch(
           _equality_flex(m.is_sparse, newton),
           dim=(d.nworld, m.eq_flex_adr.size, m.nflexedge),
@@ -5210,6 +5256,8 @@ def make_constraint(m: types.Model, d: types.Data):
             d.flexedge_length,
             d.njmax,
             d.njmax_nnz,
+            efc_base,
+            jtdaj_base,
           ],
           outputs=[
             d.ne,
