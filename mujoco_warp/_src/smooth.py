@@ -1472,32 +1472,24 @@ def _factor_i_sparse_lanes(nlevels: int, nM: int):
 # straight-line code with two SIMD shuffles per update and no barriers or threadgroup memory. The same operations in
 # the same order as the serial kernel (bitwise). Falls back to the serial kernels above 32 entries per row.
 _METAL_LDL_UNROLLED = os.environ.get("MJW_METAL_LDL_UNROLLED", "1") != "0"
+_METAL_LDL_UNROLLED_SOLVE = os.environ.get("MJW_METAL_LDL_UNROLLED_SOLVE", "0") == "1"
 _LDL_SCHEDULES: dict = {}
 
 
 def _ldl_schedule(m: Model):
-  """(key, rowadr, rownnz, updates in the serial order) of the sparse block's L'DL, cached per model layout."""
-  rowadr = tuple(int(x) for x in m.M_rowadr.numpy())
-  rownnz = tuple(int(x) for x in m.M_rownnz.numpy())
-  ups = m.qLD_all_updates.numpy()
-  off = m.qLD_level_offsets.numpy()
-  order = []
-  for level in range(len(off) - 2, -1, -1):        # deepest target level first, list order within (the serial kernel)
-    for u in range(int(off[level]), int(off[level + 1])):
-      order.append((int(ups[u][0]), int(ups[u][1]), int(ups[u][2])))
-  back = []
-  for level in range(len(off) - 1):                # the serial backward pass: shallow target levels first, list order
-    for u in range(int(off[level]), int(off[level + 1])):
-      back.append((int(ups[u][0]), int(ups[u][1]), int(ups[u][2])))
-  sparse = tuple(int(x) == Q_LD_BLOCK_SPARSE for x in m.qLD_block_adr.numpy())
-  key = hash((rowadr, rownnz, tuple(order), sparse, m.nv, m.nM))
-  _LDL_SCHEDULES[key] = (rowadr, rownnz, order, back, sparse, m.nv, m.nM)
+  """Key of the model's unrolled L'DL schedule (built in put_model as m.qLD_unrolled: rowadr, rownnz, the updates in
+  the serial forward order, the serial backward order, the sparse-block mask); registered for the source generator."""
+  rowadr, rownnz, order, back, sparse = m.qLD_unrolled
+  key = hash((rowadr, rownnz, order, sparse, m.nv, m.nM))
+  if key not in _LDL_SCHEDULES:
+    _LDL_SCHEDULES[key] = (rowadr, rownnz, list(order), list(back), sparse, m.nv, m.nM)
   return key
 
 
 def _ldl_unrolled_source(key: int, solve: bool) -> str:
   rowadr, rownnz, order, back, sparse, nv, nM = _LDL_SCHEDULES[key]
   L = []
+  L.append("#pragma clang fp contract(off)")   # the serial kernels' mul and sub are separate calls: no fused multiply-add
   if not solve:
     # factor: reg[i] = M[rowadr[i] + lane] for lane < rownnz[i]
     L.append("#if defined(__METAL_VERSION__)")
@@ -1600,9 +1592,10 @@ def _ldl_unrolled_ok(m: Model) -> bool:
   return (
     _METAL_LDL_UNROLLED
     and getattr(wp.get_device(), "is_metal", False)
+    and bool(getattr(m, "qLD_unrolled", ()))
     and m.nv <= 64
-    and int(m.M_rownnz.numpy().max()) <= 32
-    and len(m.qLD_all_updates) > 0
+    and max(m.qLD_unrolled[1]) <= 32
+    and len(m.qLD_unrolled[2]) > 0
   )
 
 
@@ -3984,7 +3977,9 @@ def _solve_LD_sparse(
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
   nlevels = len(m.qLD_updates)
   if getattr(wp.get_device(), "is_metal", False):
-    if _ldl_unrolled_ok(m) and not (_METAL_LDL_CHAINS or _METAL_LDL_LANES):
+    # (the unrolled solve, _solve_LD_sparse_unrolled, measured 0.79 vs 0.21 ms per 4096 G1 worlds: a 782-step dependent
+    # shuffle chain; kept for A/B, MJW_METAL_LDL_UNROLLED_SOLVE=1)
+    if _ldl_unrolled_ok(m) and _METAL_LDL_UNROLLED_SOLVE and not (_METAL_LDL_CHAINS or _METAL_LDL_LANES):
       wp.launch_tiled(_solve_LD_sparse_unrolled(_ldl_schedule(m)), dim=d.nworld, inputs=[L, D, y], outputs=[x], block_dim=32)
       return
     if _METAL_LDL_CHAINS and not _METAL_LDL_LANES:

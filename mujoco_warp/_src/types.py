@@ -2047,6 +2047,7 @@ class Model:
   qLD_updates_bysrc: array("nqLD_all_updates", wp.vec3i)
   qLD_src_adr: array("nv", wp.vec3i)
   qLD_row_adr: array("nv", int)
+  qLD_unrolled: tuple
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

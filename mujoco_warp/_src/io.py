@@ -1060,6 +1060,16 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_chain_level_offsets = level_off
   m.qLD_updates_bysrc = bysrc if bysrc else [(0, 0, 0)]
   m.qLD_src_adr = src_adr
+  # unrolled register L'DL (smooth._factor_i_sparse_unrolled): the serial kernels' orders as plain tuples, hashed
+  # per model layout (no device reads at launch time, which may be inside a graph capture)
+  fwd = []
+  for level in sorted(sparse_updates, reverse=True):
+    fwd.extend((int(i), int(k), int(a)) for i, k, a in sparse_updates[level])
+  bwd = []
+  for level in sorted(sparse_updates):
+    bwd.extend((int(i), int(k), int(a)) for i, k, a in sparse_updates[level])
+  m.qLD_unrolled = (tuple(int(x) for x in mjm.M_rowadr), tuple(int(x) for x in mjm.M_rownnz), tuple(fwd), tuple(bwd),
+                    tuple(int(_lay["dof_adr"][k]) == types.Q_LD_BLOCK_SPARSE for k in range(mjm.nv)))
   m.qLD_lane_pairs = pairs if pairs else [(-1, 0, 0, 0)]
   m.qLD_lane_pair_offsets = pair_offsets
   m.qLD_lane_rows = rows_flat if rows_flat else [(0, 0, 0)]
