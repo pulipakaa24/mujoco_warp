@@ -1532,6 +1532,12 @@ class Model:
     qLD_updates: sparse factor updates grouped by tree level
     qLD_all_updates: tuple of all levels concatenated
     qLD_level_offsets: tuple of start offsets for each level
+    qLD_updates_byrow: the same updates, per level re-grouped by target row (list order kept within a row)
+    qLD_lane_pairs: (target row, element, first update, one past last update) per level for the lane-parallel Metal
+                    L'DL kernels; a row's pairs never straddle a 32-lane block (idle pairs have row -1)
+    qLD_lane_pair_offsets: start offsets of the pairs per level
+    qLD_lane_rows: (target row, first update, one past last update) per level (one entry per row)
+    qLD_lane_row_offsets: start offsets of the rows per level
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2025,6 +2031,11 @@ class Model:
   qLD_updates: tuple[array("nqLD_all_updates", wp.vec3i), ...]
   qLD_all_updates: array("nqLD_all_updates", wp.vec3i)
   qLD_level_offsets: array("nqLD_level_offsets", int)
+  qLD_updates_byrow: array("nqLD_all_updates", wp.vec3i)
+  qLD_lane_pairs: array("nqLD_lane_pairs", wp.vec4i)
+  qLD_lane_pair_offsets: array("nqLD_level_offsets", int)
+  qLD_lane_rows: array("nqLD_lane_rows", wp.vec3i)
+  qLD_lane_row_offsets: array("nqLD_level_offsets", int)
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

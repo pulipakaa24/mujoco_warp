@@ -993,6 +993,35 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_all_updates = all_updates_flat if all_updates_flat else [(0, 0, 0)]
   m.qLD_level_offsets = level_offsets
 
+  # Lane-parallel schedule of the same updates (Metal, smooth._factor_i_sparse_lanes / _solve_LD_sparse_lanes): a
+  # level holds the updates whose target row i has that depth, so within a level every update targets a distinct
+  # row and reads deeper rows only. One lane per (target row, element) applies that row's updates in list order,
+  # rows and elements in parallel: the arithmetic per element is the serial kernel's, in the same order. A row's
+  # element lanes must run in lockstep (the diagonal lane reads the raw L[k, i] before it stores the scaled one),
+  # so a row's pairs never straddle a 32-lane block; idle pairs carry row -1.
+  byrow, pairs, pair_offsets, rows_flat, row_offsets = [], [], [0], [], [0]
+  for level in sorted(sparse_updates):
+    rows = {}
+    for u in sparse_updates[level]:
+      rows.setdefault(int(u[0]), []).append(u)
+    for i in sorted(rows):
+      u0 = len(byrow)
+      byrow.extend(rows[i])
+      u1 = len(byrow)
+      rows_flat.append((i, u0, u1))
+      nnz = int(mjm.M_rownnz[i])
+      used = (len(pairs) - pair_offsets[-1]) % 32
+      if used + nnz > 32:
+        pairs.extend([(-1, 0, 0, 0)] * (32 - used))
+      pairs.extend((i, j, u0, u1) for j in range(nnz))
+    pair_offsets.append(len(pairs))
+    row_offsets.append(len(rows_flat))
+  m.qLD_updates_byrow = byrow if byrow else [(0, 0, 0)]
+  m.qLD_lane_pairs = pairs if pairs else [(-1, 0, 0, 0)]
+  m.qLD_lane_pair_offsets = pair_offsets
+  m.qLD_lane_rows = rows_flat if rows_flat else [(0, 0, 0)]
+  m.qLD_lane_row_offsets = row_offsets
+
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
   # MuJoCo stores diagonal-only in the compact (M_rownnz, M_rowadr) layout
@@ -1202,6 +1231,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nsensor_collision_start_adr": len(m.sensor_collision_start_adr),
       "nqLD_all_updates": len(m.qLD_all_updates),
       "nqLD_level_offsets": len(m.qLD_level_offsets),
+      "nqLD_lane_pairs": len(m.qLD_lane_pairs),
+      "nqLD_lane_rows": len(m.qLD_lane_rows),
       "nM_fullm": len(m.M_fullm_i),
       "nM_fullm_upper": len(m.M_fullm_upper_i),
       "nqD_fullm": len(m.qD_fullm_i),

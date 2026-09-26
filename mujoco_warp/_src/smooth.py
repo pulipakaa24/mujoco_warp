@@ -14,6 +14,8 @@
 # ==============================================================================
 
 
+import os
+
 import warp as wp
 
 from mujoco_warp._src import math
@@ -1222,6 +1224,75 @@ def _qLDiag_div(
   D_out[worldid, dofid] = 1.0 / L_in[worldid, diag_i]
 
 
+# Metal sparse L'DL kernels (MetalSim): "lanes" = one world per SIMD group, the factor in threadgroup memory,
+# lanes over (target row, element) pairs of a level (bitwise the serial kernel's arithmetic, see io.py);
+# "serial" = one world per thread (the previous form, kept for A/B). MJW_METAL_LDL_LANES=0 selects serial.
+_METAL_LDL_LANES = os.environ.get("MJW_METAL_LDL_LANES", "1") != "0"
+
+
+@cache_kernel
+def _factor_i_sparse_lanes(nlevels: int, nM: int):
+  """Sparse L'*D*L factorization, one world per SIMD group with the factor in threadgroup memory (Metal).
+
+  Level by level (deepest target rows first, as the serial kernel), lane p of the level's (row, element)
+  pairs applies every update of its row to its element in list order; rows of one level are independent
+  (distinct rows of one depth, reading deeper rows only) and elements of one row are independent, so the
+  per-element arithmetic and its order are exactly the serial kernel's. The diagonal element's lane is the
+  one that stores the scaled L[k, i] (it has just read the raw value as its own operand, and a row's lanes
+  run in lockstep within one 32-lane block). One SIMD-group barrier per level.
+  """
+  NLEVELS = nlevels
+  NM = nM
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    # In:
+    updates_byrow: wp.array[wp.vec3i],
+    lane_pairs: wp.array[wp.vec4i],
+    pair_offsets: wp.array[int],
+    M_in: wp.array2d[float],
+    # Out:
+    L_out: wp.array2d[float],
+    D_out: wp.array2d[float],
+  ):
+    worldid, lane = wp.tid()
+    Lt = wp.tile_load(M_in[worldid], shape=wp.static(NM), storage="shared")
+    _syncthreads()
+    for level in range(wp.static(NLEVELS)):
+      level_idx = wp.static(NLEVELS) - 1 - level
+      p1 = pair_offsets[level_idx + 1]
+      for p in range(pair_offsets[level_idx] + lane, p1, wp.block_dim()):
+        pr = lane_pairs[p]
+        i = pr[0]
+        if i >= 0:
+          j = pr[1]
+          Madr_ij = M_rowadr[i] + j
+          diag_lane = j == M_rownnz[i] - 1
+          for u in range(pr[2], pr[3]):
+            update = updates_byrow[u]
+            k = update[1]
+            Madr_ki = update[2]
+            rowadr_k = M_rowadr[k]
+            tmp = Lt[Madr_ki] / Lt[rowadr_k + M_rownnz[k] - 1]
+            Lt[Madr_ij] = Lt[Madr_ij] - Lt[rowadr_k + j] * tmp
+            if diag_lane:
+              Lt[Madr_ki] = tmp
+      _syncthreads()
+    for e in range(lane, wp.static(NM), wp.block_dim()):
+      L_out[worldid, e] = Lt[e]
+    for dofid in range(lane, D_out.shape[1], wp.block_dim()):
+      D_out[worldid, dofid] = 1.0 / Lt[M_rowadr[dofid] + M_rownnz[dofid] - 1]
+
+  return kernel
+
+
 @cache_kernel
 def _factor_i_sparse_serial(nlevels: int):
   """Whole sparse L'*D*L factorization of one world per thread (Metal).
@@ -1269,6 +1340,15 @@ def _factor_i_sparse_serial(nlevels: int):
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
   if getattr(wp.get_device(), "is_metal", False):
+    if _METAL_LDL_LANES:
+      wp.launch_tiled(
+        _factor_i_sparse_lanes(len(m.qLD_updates), m.nM),
+        dim=d.nworld,
+        inputs=[m.M_rownnz, m.M_rowadr, m.qLD_updates_byrow, m.qLD_lane_pairs, m.qLD_lane_pair_offsets, M],
+        outputs=[L, D],
+        block_dim=32,
+      )
+      return
     wp.launch(
       _factor_i_sparse_serial(len(m.qLD_updates)),
       dim=d.nworld,
@@ -3461,6 +3541,70 @@ def _solve_LD_sparse_fused(nv: int, nlevels: int):
 
 
 @cache_kernel
+def _solve_LD_sparse_lanes(nv: int, nlevels: int):
+  """_solve_LD_sparse_serial with one world per SIMD group and x in threadgroup memory (Metal).
+
+  Forward substitution: one lane per target row of a level applies the row's updates in list order (bitwise
+  the serial order). Backward substitution: the updates of a level have distinct targets k, so they run in
+  parallel over lanes (each x[k] receives one update per level, levels in the serial order). One barrier per
+  level and pass.
+  """
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    updates_byrow: wp.array[wp.vec3i],
+    level_offsets: wp.array[int],
+    lane_rows: wp.array[wp.vec3i],
+    row_offsets: wp.array[int],
+    y: wp.array2d[float],
+    # Out:
+    x_out: wp.array2d[float],
+  ):
+    worldid, lane = wp.tid()
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    xt = wp.tile_load(y[worldid], shape=NV, storage="shared")
+    _syncthreads()
+    for level in range(NLEVELS):
+      level_idx = NLEVELS - 1 - level
+      r1 = row_offsets[level_idx + 1]
+      for r in range(row_offsets[level_idx] + lane, r1, wp.block_dim()):
+        row = lane_rows[r]
+        i = row[0]
+        xi = xt[i]
+        for u in range(row[1], row[2]):
+          update = updates_byrow[u]
+          xi = xi - L[worldid, update[2]] * xt[update[1]]
+        xt[i] = xi
+      _syncthreads()
+    for dofid in range(lane, NV, wp.block_dim()):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        xt[dofid] = xt[dofid] * D[worldid, dofid]
+    _syncthreads()
+    for level in range(NLEVELS):
+      u1 = level_offsets[level + 1]
+      for u in range(level_offsets[level] + lane, u1, wp.block_dim()):
+        update = updates_byrow[u]
+        k = update[1]
+        xt[k] = xt[k] - L[worldid, update[2]] * xt[update[0]]
+      _syncthreads()
+    for dofid in range(lane, NV, wp.block_dim()):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, dofid] = xt[dofid]
+
+  return kernel
+
+
+@cache_kernel
 def _solve_LD_sparse_serial(nv: int, nlevels: int):
   """_solve_LD_sparse_fused with one world per thread in full threadgroups (Metal).
 
@@ -3516,6 +3660,15 @@ def _solve_LD_sparse(
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
   nlevels = len(m.qLD_updates)
   if getattr(wp.get_device(), "is_metal", False):
+    if _METAL_LDL_LANES:
+      wp.launch_tiled(
+        _solve_LD_sparse_lanes(m.nv, nlevels),
+        dim=d.nworld,
+        inputs=[m.qLD_block_adr, L, D, m.qLD_updates_byrow, m.qLD_level_offsets, m.qLD_lane_rows, m.qLD_lane_row_offsets, y],
+        outputs=[x],
+        block_dim=32,
+      )
+      return
     wp.launch(
       _solve_LD_sparse_serial(m.nv, nlevels),
       dim=d.nworld,
