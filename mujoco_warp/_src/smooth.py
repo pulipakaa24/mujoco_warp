@@ -1479,15 +1479,15 @@ _LDL_SCHEDULES: dict = {}
 def _ldl_schedule(m: Model):
   """Key of the model's unrolled L'DL schedule (built in put_model as m.qLD_unrolled: rowadr, rownnz, the updates in
   the serial forward order, the serial backward order, the sparse-block mask); registered for the source generator."""
-  rowadr, rownnz, order, back, sparse = m.qLD_unrolled
+  rowadr, rownnz, order, back, sparse, depth_of = m.qLD_unrolled
   key = hash((rowadr, rownnz, order, sparse, m.nv, m.nM))
   if key not in _LDL_SCHEDULES:
-    _LDL_SCHEDULES[key] = (rowadr, rownnz, list(order), list(back), sparse, m.nv, m.nM)
+    _LDL_SCHEDULES[key] = (rowadr, rownnz, list(order), list(back), sparse, m.nv, m.nM, depth_of)
   return key
 
 
 def _ldl_unrolled_source(key: int, solve: bool) -> str:
-  rowadr, rownnz, order, back, sparse, nv, nM = _LDL_SCHEDULES[key]
+  rowadr, rownnz, order, back, sparse, nv, nM, depth_of = _LDL_SCHEDULES[key]
   L = []
   L.append("#pragma clang fp contract(off)")   # the serial kernels' mul and sub are separate calls: no fused multiply-add
   if not solve:
@@ -1523,26 +1523,56 @@ def _ldl_unrolled_source(key: int, solve: bool) -> str:
         L.append(f"D_out.data[{i}] = 1.0f / L_out.data[{rowadr[i] + rownnz[i] - 1}];")
     L.append("#endif")
   else:
-    # solve: x replicated in every lane; L entries broadcast from the lane holding them
+    # solve (MJW_METAL_LDL_UNROLLED_SOLVE): x distributed over the lanes (lane i % 32 holds x[i] in register slot
+    # i // 32), L entries broadcast from the lane holding them; the updates of one level target distinct rows, so
+    # they are emitted interleaved across targets (independent chains overlap) while every target keeps its own
+    # source order (the serial kernel's: bitwise). x[k] and L[k, i] come by shuffle; only the owner of i stores.
+    def interleave(ups, key_index):
+      groups = {}
+      for u in ups:
+        groups.setdefault(u[key_index], []).append(u)
+      out = []; pos = 0
+      while any(pos < len(v) for v in groups.values()):
+        for t in groups:
+          if pos < len(groups[t]):
+            out.append(groups[t][pos])
+        pos += 1
+      return out
+
+    def by_level(ups):
+      groups = []
+      for u in ups:
+        if not groups or groups[-1][0] != depth_of[u[0]]:
+          groups.append((depth_of[u[0]], []))
+        groups[-1][1].append(u)
+      return groups
+
+    def xslot(i):
+      return f"x{i // 32}"
     L.append("#if defined(__METAL_VERSION__)")
     L.append(f"thread float reg[{nv}];")
-    L.append(f"thread float x[{nv}];")
+    L.append("thread float x0 = 0.0f; thread float x1 = 0.0f;")
     for i in range(nv):
       L.append(f"reg[{i}] = (lane < {rownnz[i]}) ? L_in.data[{rowadr[i]} + lane] : 0.0f;")
     for i in range(nv):
-      L.append(f"x[{i}] = {'y_in.data[%d]' % i if sparse[i] else '0.0f'};")
-    for (i, k, madr_ki) in order:                       # forward: x[i] -= L[k, i] x[k], serial order
-      pki = madr_ki - rowadr[k]
-      L.append(f"x[{i}] = x[{i}] - metal::simd_shuffle(reg[{k}], ushort({pki})) * x[{k}];")
+      if sparse[i]:
+        L.append(f"if (lane == {i % 32}) {xslot(i)} = y_in.data[{i}];")
+    for _, ups in by_level(order):                       # forward: x[i] -= L[k, i] x[k]
+      for (i, k, madr_ki) in interleave(ups, 0):
+        pki = madr_ki - rowadr[k]
+        L.append(f"{{ const float lki = metal::simd_shuffle(reg[{k}], ushort({pki})); const float xk = metal::simd_shuffle({xslot(k)}, ushort({k % 32}));")
+        L.append(f"  if (lane == {i % 32}) {xslot(i)} = {xslot(i)} - lki * xk; }}")
     for i in range(nv):
       if sparse[i]:
-        L.append(f"x[{i}] = x[{i}] * D_in.data[{i}];")
-    for (i, k, madr_ki) in back:                         # backward: x[k] -= L[k, i] x[i], the serial kernel's order
-      pki = madr_ki - rowadr[k]
-      L.append(f"x[{k}] = x[{k}] - metal::simd_shuffle(reg[{k}], ushort({pki})) * x[{i}];")
+        L.append(f"if (lane == {i % 32}) {xslot(i)} = {xslot(i)} * D_in.data[{i}];")
+    for _, ups in by_level(back):                        # backward: x[k] -= L[k, i] x[i]
+      for (i, k, madr_ki) in interleave(ups, 1):
+        pki = madr_ki - rowadr[k]
+        L.append(f"{{ const float lki = metal::simd_shuffle(reg[{k}], ushort({pki})); const float xi = metal::simd_shuffle({xslot(i)}, ushort({i % 32}));")
+        L.append(f"  if (lane == {k % 32}) {xslot(k)} = {xslot(k)} - lki * xi; }}")
     for i in range(nv):
       if sparse[i]:
-        L.append(f"if (lane == 0) x_out.data[{i}] = x[{i}];")
+        L.append(f"if (lane == {i % 32}) x_out.data[{i}] = {xslot(i)};")
     L.append("#else")
     L.append(f"for (int i = 0; i < {nv}; ++i) x_out.data[i] = y_in.data[i];")
     for (i, k, madr_ki) in order:

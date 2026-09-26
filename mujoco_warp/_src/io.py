@@ -1069,7 +1069,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   for level in sorted(sparse_updates):
     bwd.extend((int(i), int(k), int(a)) for i, k, a in sparse_updates[level])
   m.qLD_unrolled = (tuple(int(x) for x in mjm.M_rowadr), tuple(int(x) for x in mjm.M_rownnz), tuple(fwd), tuple(bwd),
-                    tuple(int(_lay["dof_adr"][k]) == types.Q_LD_BLOCK_SPARSE for k in range(mjm.nv)))
+                    tuple(int(_lay["dof_adr"][k]) == types.Q_LD_BLOCK_SPARSE for k in range(mjm.nv)),
+                    tuple(int(x) for x in dof_depth))
   m.qLD_lane_pairs = pairs if pairs else [(-1, 0, 0, 0)]
   m.qLD_lane_pair_offsets = pair_offsets
   m.qLD_lane_rows = rows_flat if rows_flat else [(0, 0, 0)]
