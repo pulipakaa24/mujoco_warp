@@ -226,8 +226,9 @@ class SolverTest(parameterized.TestCase):
         wp.array([1.0e-6], dtype=float),
         wp.array([2.0e-6], dtype=float),
         done,
+        0,
       ],
-      outputs=[solver_niter, overflow, nsolving, done],
+      outputs=[solver_niter, overflow, nsolving, done, wp.empty(0, dtype=wp.uint32)],
     )
 
     self.assertTrue(done.numpy()[0])
@@ -254,8 +255,9 @@ class SolverTest(parameterized.TestCase):
         wp.array([1.0], dtype=float),
         wp.array([1.0], dtype=float),
         done,
+        0,
       ],
-      outputs=[solver_niter, overflow, nsolving, done],
+      outputs=[solver_niter, overflow, nsolving, done, wp.empty(0, dtype=wp.uint32)],
     )
 
     self.assertTrue(done.numpy()[0])
