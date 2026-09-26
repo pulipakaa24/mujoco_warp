@@ -2552,6 +2552,12 @@ class SolverContext:
   # MJW_ELLIPTIC_INCREMENTAL=2: h + hc assembled by the per-entry cone kernel (htot), factorized by the plain
   # register Cholesky
   htot: wp.array3d[float] = None
+  # elliptic cone term as rank-1 update vectors (MJW_ELLIPTIC_CONE_UPDATE=1, solver._launch_cone_update)
+  cone_vecs: wp.array3d[float] = None      # (nworld, kmax, nv_pad): v_c = (L_con^T Z)_c per cone contact
+  cone_nvec: wp.array[int] = None          # vectors per world (0 when the world takes the per-entry path)
+  cone_count_big: wp.array[int] = None     # cone contacts of worlds above kmax (0 otherwise): the per-entry kernel's count
+  cone_big: wp.array[int] = None
+  hfactor_valid: wp.array[int] = None      # 1 when hfactor holds the factor of h (M + J'DJ over QUADRATIC rows)
 
 
 @dataclasses.dataclass
