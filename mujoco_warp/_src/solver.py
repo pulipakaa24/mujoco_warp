@@ -1587,10 +1587,25 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext):
   _linesearch_iterative(m, d, ctx, fuse_jv)
 
 
+# Warm start of the constraint solve. MuJoCo C (engine_forward.c warmstart()) starts from the better of qacc_warmstart
+# (the previous step's qacc) and qacc_smooth by cost; upstream MuJoCo Warp starts from qacc_warmstart. With
+# MJW_WARMSTART_EXTRAP=1 the start is the linear extrapolation 2 * qacc_warmstart - qacc_ws_prev (qacc_ws_prev = the
+# warm start of the previous solve, i.e. the qacc before that), taken only when qacc_warmstart is still what the last
+# forward wrote (qacc_ws_last; a reset or a user write of qacc_warmstart falls back to the plain warm start). The
+# converged solution is the same fixed point (measured within the run-to-run floor, MetalSim elliptic_warmstart note);
+# Newton iterations on G1 walking states: elliptic 3.69 -> 2.73 mean, pyramidal 2.93 -> 1.98 (CPU device, cap 100).
+_WARMSTART_EXTRAP = os.environ.get("MJW_WARMSTART_EXTRAP", "0") == "1"
+
+
+def _warmstart_extrap(d: types.Data) -> bool:
+  return _WARMSTART_EXTRAP and d.qacc_ws_prev.shape[0] == d.nworld and d.qacc_ws_prev.shape[1] == d.qacc.shape[1]
+
+
 @cache_kernel
-def _solve_init_dof(warmstart: bool, sparse: bool):
+def _solve_init_dof(warmstart: bool, sparse: bool, extrap: bool = False):
   WARMSTART = warmstart
   SPARSE = sparse
+  EXTRAP = extrap
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
@@ -1598,14 +1613,25 @@ def _solve_init_dof(warmstart: bool, sparse: bool):
     nefc_in: wp.array[int],
     qacc_warmstart_in: wp.array2d[float],
     qacc_smooth_in: wp.array2d[float],
+    qacc_ws_last_in: wp.array2d[float],
     # Data out:
     qacc_out: wp.array2d[float],
     qfrc_constraint_out: wp.array2d[float],
+    qacc_ws_prev_out: wp.array2d[float],
   ):
     worldid, dofid = wp.tid()
 
     if wp.static(WARMSTART):
-      qacc_out[worldid, dofid] = qacc_warmstart_in[worldid, dofid]
+      ws = qacc_warmstart_in[worldid, dofid]
+      if wp.static(EXTRAP):
+        prev = qacc_ws_prev_out[worldid, dofid]
+        if ws == qacc_ws_last_in[worldid, dofid]:
+          qacc_out[worldid, dofid] = 2.0 * ws - prev
+        else:
+          qacc_out[worldid, dofid] = ws
+        qacc_ws_prev_out[worldid, dofid] = ws
+      else:
+        qacc_out[worldid, dofid] = ws
     else:
       qacc_out[worldid, dofid] = qacc_smooth_in[worldid, dofid]
 
@@ -2086,26 +2112,43 @@ def _update_gradient_h_incremental_sparse(compact: bool):
 # Metal: the five per-iteration launches between the line search and the Hessian update (zero the change
 # counters, _update_constraint_efc, qfrc_constraint = J^T force, _update_gradient_zero_grad_dot, _update_gradient_grad)
 # as one launch of 32 lanes per world; every launch is a full drain on Metal (measured ~10 us each in graph replay)
-# and an iteration in which only a few worlds are still solving costs its launches. Dense Jacobian, pyramidal cones,
-# stable-state fast path (the arguments _solver_iteration passes). Row forces / states and the per-dof sums keep the
-# per-kernel arithmetic and order (bitwise); grad_dot is a SIMD-group sum of the per-lane partials instead of atomic
-# adds in arbitrary order (float noise, as the atomics were). MJW_METAL_FUSE_UPDATE=0 disables.
+# and an iteration in which only a few worlds are still solving costs its launches. Dense Jacobian, stable-state fast
+# path (the arguments _solver_iteration passes). Row forces / states and the per-dof sums keep the per-kernel
+# arithmetic and order (bitwise); grad_dot is a SIMD-group sum of the per-lane partials instead of atomic adds in
+# arbitrary order (float noise, as the atomics were). MJW_METAL_FUSE_UPDATE=0 disables.
+# Elliptic cones (incremental mode 2, 2026-09-26): the same kernel evaluates the CONE rule of _update_constraint_efc
+# (a CONE-state row counts as a state change, as there) and lane 0 then lists the world's CONE-state contacts with
+# their curvature terms (_update_gradient_JTCJ_cone_list, verbatim), so the cone list launch also goes; with
+# MJW_METAL_FUSE_HTOT=1 the 32 lanes also apply the flipped-row deltas to h and write h + cone term into htot
+# (_update_gradient_JTCJ_dense_world2_htot's per-entry arithmetic, one entry per lane iteration instead of one
+# thread per (world, entry)). Elliptic: 11 -> 6 launches per iteration (5 with the htot fusion).
+# MJW_METAL_FUSE_UPDATE_CPU=1 takes the fused kernels on the CPU device (tests).
 _METAL_FUSE_UPDATE = os.environ.get("MJW_METAL_FUSE_UPDATE", "1") != "0"
+_METAL_FUSE_UPDATE_CPU = os.environ.get("MJW_METAL_FUSE_UPDATE_CPU", "0") == "1"
+_METAL_FUSE_HTOT = os.environ.get("MJW_METAL_FUSE_HTOT", "0") == "1"
 
 
 def _fuse_update(m: types.Model, ctx) -> bool:
-  return (
-    _METAL_FUSE_UPDATE
-    and getattr(wp.get_device(), "is_metal", False)
-    and not m.is_sparse
-    and not _sparse_compact(ctx)
-    and m.opt.cone != types.ConeType.ELLIPTIC
-  )
+  dev = wp.get_device()
+  if not (_METAL_FUSE_UPDATE and (getattr(dev, "is_metal", False) or (_METAL_FUSE_UPDATE_CPU and dev.is_cpu))):
+    return False
+  if m.is_sparse or _sparse_compact(ctx):
+    return False
+  if m.opt.cone != types.ConeType.ELLIPTIC:
+    return True
+  return _fuse_update_elliptic(m)
+
+
+def _fuse_update_elliptic(m: types.Model) -> bool:
+  """The fused per-iteration launch covers elliptic cones on the incremental mode-2 path (cone list + htot)."""
+  return _elliptic_incremental(m) and _ELLIPTIC_INCREMENTAL_MODE == 2 and not _ELLIPTIC_CONE_UPDATE
 
 
 @cache_kernel
-def _update_constraint_gradient_fused(nv: int):
+def _update_constraint_gradient_fused(nv: int, elliptic: bool = False, fuse_htot: bool = False):
   NV = nv
+  ELLIPTIC = elliptic
+  FUSE_HTOT = fuse_htot
 
   @wp.func_native(snippet="WP_TILE_SYNC();")
   def _syncthreads():
@@ -2113,16 +2156,27 @@ def _update_constraint_gradient_fused(nv: int):
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
+    # Model:
+    opt_impratio_invsqrt: wp.array[float],
+    dof_tri_row: wp.array[int],
+    dof_tri_col: wp.array[int],
     # Data in:
     ne_in: wp.array[int],
     nf_in: wp.array[int],
     nefc_in: wp.array[int],
+    contact_friction_in: wp.array[types.vec5],
+    contact_dim_in: wp.array[int],
+    contact_efc_address_in: wp.array2d[int],
+    efc_type_in: wp.array2d[int],
+    efc_id_in: wp.array2d[int],
     efc_J_in: wp.array3d[float],
     efc_D_in: wp.array2d[float],
     efc_frictionloss_in: wp.array2d[float],
     efc_Ma_in: wp.array2d[float],
     qfrc_smooth_in: wp.array2d[float],
     njmax_in: int,
+    nacon_in: wp.array[int],
+    ncone_max: int,
     # In:
     ctx_Jaref_in: wp.array2d[float],
     ctx_ls_exhausted_in: wp.array[bool],
@@ -2141,6 +2195,11 @@ def _update_constraint_gradient_fused(nv: int):
     ctx_newton_decrement_out: wp.array[float],
     ctx_grad_scale_out: wp.array[float],
     ctx_search_unchanged_out: wp.array[bool],
+    cone_count_out: wp.array[int],
+    cone_efcid_out: wp.array2d[int],
+    cone_terms_out: wp.array2d[types.vec16],
+    ctx_h_out: wp.array3d[float],
+    ctx_htot_out: wp.array3d[float],
   ):
     worldid, lane = wp.tid()
     done = ctx_done_in[worldid]
@@ -2152,15 +2211,24 @@ def _update_constraint_gradient_fused(nv: int):
         ctx_search_unchanged_out[worldid] = True
     if done:
       return
+    if wp.static(ELLIPTIC):
+      # the fast path (no state change below) returns before the cone list: no CONE rows then, count 0
+      if lane == 0:
+        cone_count_out[worldid] = 0
     _syncthreads()
 
-    # _update_constraint_efc (pyramidal rows), one lane per row
+    # _update_constraint_efc, one lane per row (pyramidal rows; the CONE rule for elliptic contact rows)
     if lane == 0:
       if ctx_ls_exhausted_in[worldid]:
         wp.atomic_add(state_changed_count_out, worldid, 1)
     nefc = wp.min(njmax_in, nefc_in[worldid])
     ne = ne_in[worldid]
     nf = nf_in[worldid]
+    impratio_invsqrt = float(0.0)
+    nacon = int(0)
+    if wp.static(ELLIPTIC):
+      impratio_invsqrt = opt_impratio_invsqrt[worldid % opt_impratio_invsqrt.shape[0]]
+      nacon = nacon_in[0]
     for efcid in range(lane, nefc, wp.block_dim()):
       old_state = efc_state_out[worldid, efcid]
       is_equality = efcid < ne
@@ -2168,20 +2236,55 @@ def _update_constraint_gradient_fused(nv: int):
       frictionloss = float(0.0)
       if is_friction:
         frictionloss = efc_frictionloss_in[worldid, efcid]
+      is_elliptic = bool(False)
+      efcid0 = int(-1)
+      jaref0 = float(0.0)
+      D0 = float(0.0)
+      mu = float(0.0)
+      ufrictionj = float(0.0)
+      TT = float(0.0)
+      if wp.static(ELLIPTIC):
+        is_elliptic = efc_type_in[worldid, efcid] == types.ConstraintType.CONTACT_ELLIPTIC
+        if is_elliptic:
+          # the early returns of _update_constraint_efc: the row is left as it is, nothing is counted
+          conid = efc_id_in[worldid, efcid]
+          if conid >= nacon:
+            continue
+          efcid0 = contact_efc_address_in[conid, 0]
+          if efcid0 < 0:
+            continue
+          dim = contact_dim_in[conid]
+          friction = contact_friction_in[conid]
+          mu = friction[0] * impratio_invsqrt
+          jaref0 = ctx_Jaref_in[worldid, efcid0]
+          D0 = efc_D_in[worldid, efcid0]
+          missing = bool(False)
+          for j in range(1, dim):
+            efcidj = contact_efc_address_in[conid, j]
+            if efcidj < 0:
+              missing = True
+            else:
+              frictionj = friction[j - 1]
+              uj = ctx_Jaref_in[worldid, efcidj] * frictionj
+              TT += uj * uj
+              if efcid == efcidj:
+                ufrictionj = uj * frictionj
+          if missing:
+            continue
       res = _eval_constraint(
         is_equality,
         is_friction,
-        False,
+        is_elliptic,
         ctx_Jaref_in[worldid, efcid],
         efc_D_in[worldid, efcid],
         frictionloss,
         efcid,
-        -1,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        efcid0,
+        jaref0,
+        D0,
+        mu,
+        ufrictionj,
+        TT,
       )
       new_state = int(res[1])
       efc_force_out[worldid, efcid] = res[0]
@@ -2191,7 +2294,11 @@ def _update_constraint_gradient_fused(nv: int):
       if old_quad != new_quad:
         idx = wp.atomic_add(quad_changed_count_out, worldid, 1)
         quad_changed_ids_out[worldid, idx] = efcid
-      if old_state != new_state:
+      row_changed = old_state != new_state
+      if wp.static(ELLIPTIC):
+        # a CONE-state row changes H every iteration (its curvature depends on Jaref): never the fast path
+        row_changed = row_changed or new_state == types.ConstraintState.CONE.value
+      if row_changed:
         wp.atomic_add(state_changed_count_out, worldid, 1)
     _syncthreads()
 
@@ -2230,7 +2337,168 @@ def _update_constraint_gradient_fused(nv: int):
     if lane == 0:
       ctx_grad_dot_out[worldid] = total[0]
 
+    if wp.static(ELLIPTIC):
+      # _update_gradient_JTCJ_cone_list (one thread per world): the CONE-state contacts in row order with their
+      # curvature terms, from the states just written
+      if lane == 0:
+        count = int(0)
+        efcid0 = int(0)
+        while efcid0 < nefc:
+          if efc_type_in[worldid, efcid0] != types.ConstraintType.CONTACT_ELLIPTIC:
+            efcid0 += 1
+            continue
+          conid = efc_id_in[worldid, efcid0]
+          condim = contact_dim_in[conid]
+          if contact_efc_address_in[conid, 0] != efcid0:
+            efcid0 += 1
+            continue
+          efcid_next = efcid0 + condim
+          if efc_state_out[worldid, efcid0] != types.ConstraintState.CONE:
+            efcid0 = efcid_next
+            continue
+
+          fri = contact_friction_in[conid]
+          mu = fri[0] * impratio_invsqrt
+          mu2 = mu * mu
+          dm = math.safe_div(efc_D_in[worldid, efcid0], mu2 * (1.0 + mu2))
+          if dm == 0.0:
+            efcid0 = efcid_next
+            continue
+
+          n = ctx_Jaref_in[worldid, efcid0] * mu
+          terms = types.vec16()
+          terms[6] = mu
+          tt = float(0.0)
+          nrows = int(1)
+          for dim in range(1, condim):
+            efcid = contact_efc_address_in[conid, dim]
+            if efcid >= 0:
+              scale = fri[dim - 1]
+              u = ctx_Jaref_in[worldid, efcid] * scale
+              terms[dim] = u
+              terms[6 + dim] = scale
+              tt += u * u
+              nrows = dim + 1
+          t = wp.max(wp.sqrt(tt), types.MJ_MINVAL)
+          ttt = wp.max(t * t * t, types.MJ_MINVAL)
+          mu_tinv = math.safe_div(mu, t)
+          terms[0] = float(nrows)
+          terms[12] = dm
+          terms[13] = mu_tinv
+          terms[14] = mu * math.safe_div(n, ttt)
+          terms[15] = mu2 - n * mu_tinv
+          if count < ncone_max:
+            cone_efcid_out[worldid, count] = efcid0
+            cone_terms_out[worldid, count] = terms
+            count += 1
+          efcid0 = efcid_next
+        cone_count_out[worldid] = count
+
+      if wp.static(FUSE_HTOT):
+        # _update_gradient_JTCJ_dense_world2_htot, one entry per lane iteration (the same arithmetic per entry)
+        _syncthreads()
+        n_changes = quad_changed_count_out[worldid]
+        ncone = cone_count_out[worldid]
+        for elementid in range(lane, dof_tri_row.shape[0], wp.block_dim()):
+          dof1id = dof_tri_row[elementid]
+          dof2id = dof_tri_col[elementid]
+          h = ctx_h_out[worldid, dof1id, dof2id]
+          if n_changes > 0:
+            delta = float(0.0)
+            for change_idx in range(n_changes):
+              efcid = quad_changed_ids_out[worldid, change_idx]
+              Jrow = efc_J_in[worldid, efcid, dof1id]
+              if Jrow == 0.0:
+                continue
+              Jcol = efc_J_in[worldid, efcid, dof2id]
+              if Jcol == 0.0:
+                continue
+              D = efc_D_in[worldid, efcid]
+              if efc_state_out[worldid, efcid] == types.ConstraintState.QUADRATIC.value:
+                delta += D * Jrow * Jcol
+              else:
+                delta -= D * Jrow * Jcol
+            if delta != 0.0:
+              h += delta
+              ctx_h_out[worldid, dof1id, dof2id] = h
+          hsum = float(0.0)
+          for k in range(ncone):
+            efcid0 = cone_efcid_out[worldid, k]
+            terms = cone_terms_out[worldid, k]
+            nrows = int(terms[0])
+            mu = terms[6]
+            z01 = mu * efc_J_in[worldid, efcid0, dof1id]
+            z02 = mu * efc_J_in[worldid, efcid0, dof2id]
+            projection1 = float(0.0)
+            projection2 = float(0.0)
+            tangent_dot = float(0.0)
+            for dim in range(1, nrows):
+              efcid = efcid0 + dim
+              scale = terms[6 + dim]
+              u = terms[dim]
+              z1 = scale * efc_J_in[worldid, efcid, dof1id]
+              z2 = scale * efc_J_in[worldid, efcid, dof2id]
+              projection1 += u * z1
+              projection2 += u * z2
+              tangent_dot += z1 * z2
+            hsum += _elliptic_hessian_entry_from_projections(
+              terms[12], terms[13], terms[14], terms[15], z01, z02, projection1, projection2, tangent_dot
+            )
+          ctx_htot_out[worldid, dof1id, dof2id] = h + hsum
+
   return kernel
+
+
+def _launch_update_fused(m: types.Model, d: types.Data, ctx: SolverContext, elliptic: bool, fuse_htot: bool):
+  """The fused per-iteration launch (_update_constraint_gradient_fused)."""
+  wp.launch_tiled(
+    _update_constraint_gradient_fused(m.nv, elliptic, fuse_htot),
+    dim=d.nworld,
+    inputs=[
+      m.opt.impratio_invsqrt,
+      m.dof_tri_row,
+      m.dof_tri_col,
+      d.ne,
+      d.nf,
+      d.nefc,
+      d.contact.friction,
+      d.contact.dim,
+      d.contact.efc_address,
+      d.efc.type,
+      d.efc.id,
+      d.efc.J,
+      d.efc.D,
+      d.efc.frictionloss,
+      d.efc.Ma,
+      d.qfrc_smooth,
+      d.njmax,
+      d.nacon,
+      ctx.cone_efcid.shape[1],
+      ctx.Jaref,
+      ctx.ls_exhausted,
+      ctx.alpha,
+      ctx.done,
+    ],
+    outputs=[
+      d.efc.force,
+      d.efc.state,
+      d.qfrc_constraint,
+      ctx.quad_changed_ids,
+      ctx.quad_changed_count,
+      ctx.state_changed_count,
+      ctx.grad,
+      ctx.grad_dot,
+      ctx.newton_decrement,
+      ctx.grad_scale,
+      ctx.search_unchanged,
+      ctx.cone_count,
+      ctx.cone_efcid,
+      ctx.cone_terms,
+      ctx.h,
+      ctx.htot,
+    ],
+    block_dim=32,
+  )
 
 
 def _update_constraint(
@@ -3428,6 +3696,11 @@ def _launch_cone_htot(m: types.Model, d: types.Data, ctx: SolverContext):
     ],
     outputs=[ctx.cone_count, ctx.cone_efcid, ctx.cone_terms],
   )
+  _launch_htot_apply(m, d, ctx)
+
+
+def _launch_htot_apply(m: types.Model, d: types.Data, ctx: SolverContext):
+  """Flipped-row deltas into h and h + cone term into htot, from the cone list (one thread per (world, entry))."""
   wp.launch(
     _update_gradient_JTCJ_dense_world2_htot,
     dim=(d.nworld, m.dof_tri_row.size),
@@ -4688,16 +4961,16 @@ def _solver_iteration(
   incremental = _use_incremental(m)
 
   if incremental and _fuse_update(m, ctx):
-    wp.launch_tiled(
-      _update_constraint_gradient_fused(m.nv),
-      dim=d.nworld,
-      inputs=[d.ne, d.nf, d.nefc, d.efc.J, d.efc.D, d.efc.frictionloss, d.efc.Ma, d.qfrc_smooth, d.njmax,
-              ctx.Jaref, ctx.ls_exhausted, ctx.alpha, ctx.done],
-      outputs=[d.efc.force, d.efc.state, d.qfrc_constraint, ctx.quad_changed_ids, ctx.quad_changed_count,
-               ctx.state_changed_count, ctx.grad, ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
-      block_dim=32,
-    )
-    _update_gradient_incremental(m, d, ctx, stable_fast=True, grad_done=True)
+    elliptic = m.opt.cone == types.ConeType.ELLIPTIC
+    fuse_htot = elliptic and _METAL_FUSE_HTOT
+    _launch_update_fused(m, d, ctx, elliptic, fuse_htot)
+    if elliptic:
+      # mode 2 with the cone list already built: deltas + cone term into htot (unless fused), register Cholesky
+      if not fuse_htot:
+        _launch_htot_apply(m, d, ctx)
+      _launch_htot_cholesky(m, d, ctx, skip_noflip=True)
+    else:
+      _update_gradient_incremental(m, d, ctx, stable_fast=True, grad_done=True)
     _solver_iteration_finish(m, d, ctx, nsolving)
     return
 
@@ -4848,10 +5121,10 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   """Finds forces that satisfy constraints."""
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
-    _solve_init_dof(warmstart, m.is_sparse),
+    _solve_init_dof(warmstart, m.is_sparse, _warmstart_extrap(d)),
     dim=(d.nworld, m.nv),
-    inputs=[d.nefc, d.qacc_warmstart, d.qacc_smooth],
-    outputs=[d.qacc, d.qfrc_constraint],
+    inputs=[d.nefc, d.qacc_warmstart, d.qacc_smooth, d.qacc_ws_last],
+    outputs=[d.qacc, d.qfrc_constraint, d.qacc_ws_prev],
   )
 
   #  context

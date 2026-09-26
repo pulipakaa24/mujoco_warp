@@ -220,6 +220,20 @@ def _next_activation(
       act_out[worldid, j] = act
 
 
+@wp.kernel
+def _save_warmstart(
+  # Data in:
+  qacc_in: wp.array2d[float],
+  # Data out:
+  qacc_warmstart_out: wp.array2d[float],
+  qacc_ws_last_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  qacc = qacc_in[worldid, dofid]
+  qacc_warmstart_out[worldid, dofid] = qacc
+  qacc_ws_last_out[worldid, dofid] = qacc
+
+
 @cache_kernel
 def _next_time_builder(warn_overflow: int):
   @wp.kernel(module="unique", enable_backward=False)
@@ -358,7 +372,11 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
     outputs=[d.time, d.overflow],
   )
 
-  wp.copy(d.qacc_warmstart, d.qacc)
+  if solver._warmstart_extrap(d):
+    # the copy also records what was written, so the solve can tell a reset / user write of qacc_warmstart apart
+    wp.launch(_save_warmstart, dim=(d.nworld, m.nv), inputs=[d.qacc], outputs=[d.qacc_warmstart, d.qacc_ws_last])
+  else:
+    wp.copy(d.qacc_warmstart, d.qacc)
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:

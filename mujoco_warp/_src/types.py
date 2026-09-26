@@ -2347,6 +2347,8 @@ class Data:
     overflow: overflow bitmask (OverflowType)                   (nworld,)
     face_xpos: cartesian flex face positions                    (nworld, nflexface, 9, 3)
     face_quat: cartesian flex face orientations                 (nworld, nflexface, 4)
+    qacc_ws_prev: warm start of the previous solve (MJW_WARMSTART_EXTRAP)   (nworld, nv)
+    qacc_ws_last: qacc the last forward wrote to qacc_warmstart (MJW_WARMSTART_EXTRAP)   (nworld, nv)
   """
 
   solver_niter: array("nworld", int)
@@ -2494,6 +2496,8 @@ class Data:
   overflow: array("nworld", int)
   face_xpos: array("nworld", "nflexface", 9, wp.vec3)
   face_quat: array("nworld", "nflexface", wp.quat)
+  qacc_ws_prev: array("nworld", "nv", float)
+  qacc_ws_last: array("nworld", "nv", float)
 
 
 @dataclasses.dataclass
