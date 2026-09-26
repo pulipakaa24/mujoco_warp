@@ -3075,8 +3075,9 @@ _JTDAJ_ELLIPTIC_LANES = int(os.environ.get("MJW_JTDAJ_ELLIPTIC_LANES", "32"))
 #    the plain register Cholesky factorizes (no per-lane delta loop, one tile load).
 _ELLIPTIC_INCREMENTAL_MODE = int(os.environ.get("MJW_ELLIPTIC_INCREMENTAL", "2"))
 # cone-term kernels: skip an entry's contact when the contact's Jacobian rows are zero at the entry's first dof
-# (every term of the entry is then zero); 0 = evaluate every contact for every entry (same result)
-_CONE_SKIP_ZERO = os.environ.get("MJW_CONE_SKIP_ZERO", "1") != "0"
+# (every term of the entry is then zero); measured 1-2 % slower on every model (the test loads cost more than the
+# skipped ones), so the default is 0 = evaluate every contact for every entry; 1 restores the skip (same result)
+_CONE_SKIP_ZERO = os.environ.get("MJW_CONE_SKIP_ZERO", "0") == "1"
 _ELLIPTIC_INCREMENTAL = _ELLIPTIC_INCREMENTAL_MODE != 0
 # allow the fused register-Cholesky path on the CPU device (tests of the elliptic incremental path without a GPU)
 _FUSE_H_CHOLESKY_CPU = os.environ.get("MJW_FUSE_H_CHOLESKY_CPU", "0") == "1"
