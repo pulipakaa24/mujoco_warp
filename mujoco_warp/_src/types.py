@@ -2527,6 +2527,9 @@ class SolverContext:
   # elliptic incremental Newton (MJW_ELLIPTIC_INCREMENTAL): the cone contacts' Hessian term, rebuilt every
   # iteration and added to h (which then holds only M + J'DJ over QUADRATIC rows) inside the fused Cholesky
   hc: wp.array3d[float] = None
+  # MJW_ELLIPTIC_INCREMENTAL=2: h + hc assembled by the per-entry cone kernel (htot), factorized by the plain
+  # register Cholesky
+  htot: wp.array3d[float] = None
 
 
 @dataclasses.dataclass
