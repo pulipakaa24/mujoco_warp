@@ -40,6 +40,12 @@ from mujoco_warp._src.math import make_frame
 
 # MetalSim: heightfield contacts from the prism top plane (see ccd_hfield_kernel)
 HFIELD_PLANE_CONTACTS = True
+# Which geoms take the per-triangle plane path against a heightfield: meshes of at most 256 vertices always (the G1
+# feet; every vertex is tested against the triangle's column). Primitives (sphere, capsule, box, ...) only have their
+# single support point along the triangle normal available, which misses the contact whenever that point's
+# footprint falls outside the triangle (a 2 m box on a 0.2 m heightfield: upstream's test_hfield_maxconpair, 0
+# contacts instead of 4); with False (default since 2026-09-25) they use upstream's GJK/EPA against the prism.
+HFIELD_PLANE_CONTACTS_PRIMITIVES = False
 from mujoco_warp._src.math import upper_trid_index
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
 from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
@@ -470,7 +476,10 @@ def ccd_hfield_kernel_builder(
 
           geom1.polyvert = prism
 
-          if wp.static(HFIELD_PLANE_CONTACTS):
+          plane_path = wp.static(HFIELD_PLANE_CONTACTS) and (
+            wp.static(HFIELD_PLANE_CONTACTS_PRIMITIVES) or (geomtype2 == int(GeomType.MESH) and geom2.vertnum <= 256)
+          )
+          if plane_path:
             # MetalSim: contact against the prism's top triangle plane instead of single-witness
             # GJK/EPA against the whole prism column (which returns wrong normals/depths for thin
             # convex meshes; MuJoCo C's multi-contact CCD does not have this problem). Per
