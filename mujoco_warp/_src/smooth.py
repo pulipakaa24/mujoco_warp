@@ -1224,10 +1224,12 @@ def _qLDiag_div(
   D_out[worldid, dofid] = 1.0 / L_in[worldid, diag_i]
 
 
-# Metal sparse L'DL kernels (MetalSim): "lanes" = one world per SIMD group, the factor in threadgroup memory,
-# lanes over (target row, element) pairs of a level (bitwise the serial kernel's arithmetic, see io.py);
-# "serial" = one world per thread (the previous form, kept for A/B). MJW_METAL_LDL_LANES=0 selects serial.
-_METAL_LDL_LANES = os.environ.get("MJW_METAL_LDL_LANES", "1") != "0"
+# Metal sparse L'DL kernels (MetalSim): "serial" = one world per thread (the default); "lanes" = one world per
+# SIMD group, lanes over the (target row, element) pairs of a level (bitwise the serial kernel's arithmetic, see
+# io.py). Measured 2026-09-26 at 4096 G1 worlds: lanes factor 0.57 ms / solve 0.27 vs serial 0.45 / 0.21 (the
+# per-level barriers and the 6 root levels with one to six busy lanes cost more than the shorter dependency chain
+# saves), G1 step 72.7 vs 69.9 ms; kept behind MJW_METAL_LDL_LANES=1 for A/B.
+_METAL_LDL_LANES = os.environ.get("MJW_METAL_LDL_LANES", "0") == "1"
 
 
 @cache_kernel
