@@ -30,8 +30,9 @@ The changes below modify Apache-2.0 code and are offered under the same licence.
 | `ccfaffb` | Metal: incremental Newton-Hessian update fused into the register Cholesky launch (`MJW_METAL_FUSE_H_CHOLESKY=0` restores two launches). |
 | `1791414` | `MJW_METAL_DENSE_CHOL_MAX` knob for the off-CUDA dense vs blocked Hessian Cholesky threshold (default 64, unchanged). |
 | `8fbf965` | Merge of `metalsim-flex` (`b2e9ea5..dfa5d30`); the tree MetalSim's results were produced with. |
+| `c301880` | Metal: elliptic-cone Newton Hessian without capacity-sized launches or one-lane groups. Dense Jacobian: `MJW_JTCJ_MODE` = `world2` (default; per-world cone list, then one thread per (world, Hessian entry), no atomics), `world`, `contact` (upstream's CUDA form sized from `Device.sm_count`, `MJW_JTCJ_SM_FACTOR`), `capacity` (upstream's off-CUDA fallback, `dim_block = naconmax`). Sparse Jacobian: `MJW_JTDAJ_ELLIPTIC_LANES` 32 (default; per-lane cone terms) / 1 (previous one-lane groups), `MJW_JTDAJ_GROUPS_PER_WORLD`. `MJW_CCD_GRID_WAVES` (off-CUDA CCD grid, default 0 = previous). Go2 elliptic 240 K → 580 K steps/s at 4096 worlds; MetalSim G1 task elliptic 11.0 K → 55.4 K env-steps/s. Measurements and the physics checks: MetalSim `docs/research/elliptic_cones_2026-09-25.md`. |
 
-Every flex change is behind a module-level flag that restores upstream's behaviour; the details and measurements are in
+Every flex change and every solver launch-form change is behind a module-level flag or environment variable that restores upstream's behaviour; the details and measurements are in
 the commit messages and in MetalSim's `scripts/diagnostics/deformable/UPSTREAM.md`. The same sixteen code commits are
 exported as MetalSim's `patches/mujoco_warp/0001-0016` (flex commits rebased after the throughput ones; the result
 is the tree of `8fbf965`).
