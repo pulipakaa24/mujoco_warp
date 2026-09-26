@@ -2524,6 +2524,9 @@ class SolverContext:
   cone_count: wp.array[int] = None
   cone_efcid: wp.array2d[int] = None
   cone_terms: wp.array2d[vec16] = None
+  # elliptic incremental Newton (MJW_ELLIPTIC_INCREMENTAL): the cone contacts' Hessian term, rebuilt every
+  # iteration and added to h (which then holds only M + J'DJ over QUADRATIC rows) inside the fused Cholesky
+  hc: wp.array3d[float] = None
 
 
 @dataclasses.dataclass
