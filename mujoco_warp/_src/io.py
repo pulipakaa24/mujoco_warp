@@ -1061,7 +1061,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_updates_bysrc = bysrc if bysrc else [(0, 0, 0)]
   m.qLD_src_adr = src_adr
   # unrolled register L'DL (smooth._factor_i_sparse_unrolled): the serial kernels' orders as plain tuples, hashed
-  # per model layout (no device reads at launch time, which may be inside a graph capture)
+  # per model layout (no device reads at launch time, which may be inside a graph capture). A plain attribute, not a
+  # dataclass field: it is host-side schedule data (absent on JAX-converted models, which then take the serial kernel).
   fwd = []
   for level in sorted(sparse_updates, reverse=True):
     fwd.extend((int(i), int(k), int(a)) for i, k, a in sparse_updates[level])
