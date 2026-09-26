@@ -2520,6 +2520,10 @@ class SolverContext:
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
+  # elliptic-cone contact list per world for the two-pass dense Hessian term (MJW_JTCJ_MODE=world2)
+  cone_count: wp.array[int] = None
+  cone_efcid: wp.array2d[int] = None
+  cone_terms: wp.array2d[vec16] = None
 
 
 @dataclasses.dataclass

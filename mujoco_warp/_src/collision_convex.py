@@ -15,6 +15,8 @@
 
 from typing import Tuple
 
+import os
+
 import warp as wp
 
 from mujoco_warp._src.collision_core import CollisionContext
@@ -787,6 +789,7 @@ def ccd_hfield_kernel_builder(
 
 
 _CCD_OVERSUBSCRIBE_WAVES = 2
+_CCD_GRID_WAVES = int(os.environ.get("MJW_CCD_GRID_WAVES", "0"))  # off-CUDA CCD grid sizing (see _ccd_grid_size)
 _CCD_MIN_BLOCKS = 8
 
 
@@ -1263,7 +1266,12 @@ def _ccd_grid_size(kernel, naconmax: int, device) -> int:
   # capacity. The kernel strides over the actual candidate count, so we avoid launching one
   # (mostly idle) thread per naconmax slot.
   if not device.is_cuda:
-    # Warp forces block_dim to 1 on other backends, which have no CUDA occupancy information.
+    # No CUDA occupancy information off CUDA. Metal reports its GPU core count as sm_count: size the
+    # grid from it (MJW_CCD_GRID_WAVES blocks of 256 threads per core; 0 = the previous capacity-sized
+    # launch of one thread per contact slot).
+    sm_count = getattr(device, "sm_count", 0)
+    if sm_count > 0 and _CCD_GRID_WAVES > 0:
+      return max(1, min(naconmax, _CCD_GRID_WAVES * sm_count * 256))
     return naconmax
 
   block_size, min_grid_size = wp.get_suggested_block_size(kernel, device)
