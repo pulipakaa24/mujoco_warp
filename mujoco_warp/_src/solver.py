@@ -2127,6 +2127,9 @@ def _update_gradient_h_incremental_sparse(compact: bool):
 _METAL_FUSE_UPDATE = os.environ.get("MJW_METAL_FUSE_UPDATE", "1") != "0"
 _METAL_FUSE_UPDATE_CPU = os.environ.get("MJW_METAL_FUSE_UPDATE_CPU", "0") == "1"
 _METAL_FUSE_HTOT = os.environ.get("MJW_METAL_FUSE_HTOT", "1") != "0"
+# Lanes per world of the elliptic fused launch (the row / dof / entry loops stride by the block size; the htot fusion's
+# 946-entry loop wants more than one SIMD group per world at full activity). Pyramidal keeps 32.
+_METAL_FUSE_LANES = int(os.environ.get("MJW_METAL_FUSE_LANES", "32"))
 
 
 def _fuse_update(m: types.Model, ctx) -> bool:
@@ -2498,7 +2501,7 @@ def _launch_update_fused(m: types.Model, d: types.Data, ctx: SolverContext, elli
       ctx.h,
       ctx.htot,
     ],
-    block_dim=32,
+    block_dim=_METAL_FUSE_LANES if elliptic else 32,
   )
 
 
