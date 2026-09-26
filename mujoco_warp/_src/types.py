@@ -2563,6 +2563,8 @@ class SolverContext:
   cone_count_big: wp.array[int] = None     # cone contacts of worlds above kmax (0 otherwise): the per-entry kernel's count
   cone_big: wp.array[int] = None
   hfactor_valid: wp.array[int] = None      # 1 when hfactor holds the factor of h (M + J'DJ over QUADRATIC rows)
+  # Metal graph replay early exit (solver._icb_early_exit_ranges): per-iteration ICB execution ranges, None otherwise
+  icb_ranges: wp.array[wp.uint32] = None
 
 
 @dataclasses.dataclass

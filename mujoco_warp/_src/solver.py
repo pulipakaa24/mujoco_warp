@@ -1642,18 +1642,32 @@ def _solve_init_dof(warmstart: bool, sparse: bool, extrap: bool = False):
   return kernel
 
 
-@wp.kernel(grid_stride=True)
-def _solve_init_efc(
-  # Data out:
-  solver_niter_out: wp.array[int],
-  # Out:
-  ctx_search_dot_out: wp.array[float],
-  ctx_done_out: wp.array[bool],
-):
-  worldid = wp.tid()
-  solver_niter_out[worldid] = 0
-  ctx_done_out[worldid] = False
-  ctx_search_dot_out[worldid] = 0.0
+@cache_kernel
+def _solve_init_efc(early_exit: bool = False):
+  EARLY_EXIT = early_exit
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=True)
+  def kernel(
+    # In:
+    niter: int,
+    # Data out:
+    solver_niter_out: wp.array[int],
+    # Out:
+    ctx_search_dot_out: wp.array[float],
+    ctx_done_out: wp.array[bool],
+    ranges_out: wp.array[wp.uint32],
+  ):
+    worldid = wp.tid()
+    solver_niter_out[worldid] = 0
+    ctx_done_out[worldid] = False
+    ctx_search_dot_out[worldid] = 0.0
+    if wp.static(EARLY_EXIT):
+      # every iteration's indirect execution range back to its full length (a previous replay may have zeroed it)
+      if worldid == 0:
+        for j in range(niter):
+          ranges_out[4 * j + 1] = ranges_out[4 * j + 2]
+
+  return kernel
 
 
 @cache_kernel
@@ -4873,7 +4887,9 @@ def _solve_beta_finalize_tiled(warn_overflow: int):
 
 
 @cache_kernel
-def _solve_done(warn_overflow: int):
+def _solve_done(warn_overflow: int, early_exit: bool = False):
+  EARLY_EXIT = early_exit
+
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
@@ -4886,12 +4902,14 @@ def _solve_done(warn_overflow: int):
     ctx_newton_decrement_in: wp.array[float],
     ctx_improvement_in: wp.array[float],
     ctx_done_in: wp.array[bool],
+    iteration: int,
     # Data out:
     solver_niter_out: wp.array[int],
     overflow_out: wp.array[int],
     # Out:
     nsolving_out: wp.array[int],
     ctx_done_out: wp.array[bool],
+    ranges_out: wp.array[wp.uint32],
   ):
     worldid = wp.tid()
 
@@ -4918,7 +4936,13 @@ def _solve_done(warn_overflow: int):
           )
         overflow_out[worldid] = overflow_out[worldid] | OverflowType.ITERATIONS
       ctx_done_out[worldid] = True
-      wp.atomic_add(nsolving_out, 0, -1)
+      was_solving = wp.atomic_add(nsolving_out, 0, -1)
+      if wp.static(EARLY_EXIT):
+        # the world that brought the count to zero: no later iteration has anything to do, so the indirect
+        # execution ranges of iterations iteration + 1 .. cap - 1 get length 0 and their launches are skipped
+        if was_solving == 1:
+          for j in range(iteration + 1, opt_iterations):
+            ranges_out[4 * j + 1] = wp.uint32(0)
 
   return kernel
 
@@ -4955,6 +4979,7 @@ def _solver_iteration(
   ctx: SolverContext,
   nsolving: wp.array[int],
   compact: bool = False,
+  iteration: int = 0,
 ):
   _linesearch(m, d, ctx)
 
@@ -4975,7 +5000,7 @@ def _solver_iteration(
       _launch_htot_cholesky(m, d, ctx, skip_noflip=True)
     else:
       _update_gradient_incremental(m, d, ctx, stable_fast=True, grad_done=True)
-    _solver_iteration_finish(m, d, ctx, nsolving)
+    _solver_iteration_finish(m, d, ctx, nsolving, iteration)
     return
 
   if incremental:
@@ -4997,10 +5022,10 @@ def _solver_iteration(
   else:
     _update_gradient(m, d, ctx, compact=compact)
 
-  _solver_iteration_finish(m, d, ctx, nsolving)
+  _solver_iteration_finish(m, d, ctx, nsolving, iteration)
 
 
-def _solver_iteration_finish(m: types.Model, d: types.Data, ctx: SolverContext, nsolving: wp.array[int]):
+def _solver_iteration_finish(m: types.Model, d: types.Data, ctx: SolverContext, nsolving: wp.array[int], iteration: int = 0):
   # polak-ribiere
   if m.opt.solver == types.SolverType.CG:
     wp.launch_tiled(
@@ -5037,8 +5062,9 @@ def _solver_iteration_finish(m: types.Model, d: types.Data, ctx: SolverContext, 
     )
 
   else:
+    ranges = getattr(ctx, "icb_ranges", None)
     wp.launch(
-      _solve_done(int(m.opt.warn_overflow)),
+      _solve_done(int(m.opt.warn_overflow), ranges is not None),
       dim=d.nworld,
       inputs=[
         m.nv,
@@ -5049,17 +5075,20 @@ def _solver_iteration_finish(m: types.Model, d: types.Data, ctx: SolverContext, 
         ctx.newton_decrement,
         ctx.improvement,
         ctx.done,
+        iteration,
       ],
-      outputs=[d.solver_niter, d.overflow, nsolving, ctx.done],
+      outputs=[d.solver_niter, d.overflow, nsolving, ctx.done, ranges if ranges is not None else wp.empty(0, dtype=wp.uint32)],
     )
 
 
 def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, grad: bool = True, compact: bool = False):
   # initialize some efc arrays
+  ranges = getattr(ctx, "icb_ranges", None)
   wp.launch(
-    _solve_init_efc,
+    _solve_init_efc(ranges is not None),
     dim=d.nworld,
-    outputs=[d.solver_niter, ctx.search_dot, ctx.done],
+    inputs=[m.opt.iterations],
+    outputs=[d.solver_niter, ctx.search_dot, ctx.done, ranges if ranges is not None else wp.empty(0, dtype=wp.uint32)],
   )
 
   # jaref = d.efc_J @ d.qacc - d.efc_aref
@@ -5121,9 +5150,31 @@ def solve(m: types.Model, d: types.Data):
     _solve(m, d, ctx)
 
 
+# Metal graph replay: exact per-world early exit of the Newton loop without a conditional graph node. Each iteration's
+# launches are recorded as an indirect-command-buffer execution range (Warp fork metal_capture_range_begin / _end)
+# whose length lives in ctx.icb_ranges; _solve_done's world that brings nsolving to zero writes 0 into the lengths of
+# the remaining iterations, and _solve_init_efc restores them every substep. Bitwise the fixed-count loop (the skipped
+# iterations had no active world). MJW_METAL_ICB_EARLY_EXIT=0 disables; needs the Warp fork's API and a capture.
+_METAL_ICB_EARLY_EXIT = os.environ.get("MJW_METAL_ICB_EARLY_EXIT", "1") != "0"
+
+
+def _icb_early_exit_ranges(m: types.Model) -> wp.array | None:
+  """The per-iteration execution ranges (uint32 location, length, full length, pad) when the early exit applies."""
+  if not _METAL_ICB_EARLY_EXIT or m.opt.iterations <= 1 or m.opt.graph_conditional:
+    return None
+  dev = wp.get_device()
+  if not getattr(dev, "is_metal", False) or not hasattr(wp.context, "metal_capture_range_begin"):
+    return None
+  if getattr(wp.context.runtime, "_metal_graph", None) is None:   # eager launches: nothing to gate
+    return None
+  # no memset: the backend writes the fields at the range's end (capture time); a recorded memset would clear them
+  return wp.empty(4 * m.opt.iterations, dtype=wp.uint32)
+
+
 def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
   """Finds forces that satisfy constraints."""
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+  ctx.icb_ranges = _icb_early_exit_ranges(m)
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse, _warmstart_extrap(d)),
     dim=(d.nworld, m.nv),
@@ -5163,8 +5214,12 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # This branch is mostly for when JAX is used as it is currently not compatible
     # with CUDA graph conditional.
     # It should be removed when JAX becomes compatible.
-    for _ in range(m.opt.iterations):
-      _solver_iteration(m, d, ctx, nsolving, compact=compact)
+    ranges = ctx.icb_ranges
+    for i in range(m.opt.iterations):
+      gated = ranges is not None and wp.context.metal_capture_range_begin(ranges, i)
+      _solver_iteration(m, d, ctx, nsolving, compact=compact, iteration=i)
+      if gated:
+        wp.context.metal_capture_range_end()
 
   # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
   # the fast path leaves it stale, and the per-iteration zeroing wiped it for
