@@ -1279,25 +1279,29 @@ def _factor_i_sparse_chains(nlevels: int, nM: int):
         adr = chain_adr[c]
         r0 = adr[0]
         r1 = adr[1]
+        # phase 1: updates into each row of the chain from the chain's deeper rows, targets deepest first and
+        # sources ascending (the serial order); the deeper columns scaled here are never read again
         for r in range(r0, r1):
           i = chain_rows[r]
           rowadr_i = M_rowadr[i]
           nnz_i = M_rownnz[i]
-          # updates into row i from the chain's deeper rows, sources ascending
           for rk in range(r - 1, r0 - 1, -1):
             k = chain_rows[rk]
             rowadr_k = M_rowadr[k]
-            # entry (k, i): row k's column i sits at position nnz_i - 1 of row k (same ancestor prefix)
             Madr_ki = rowadr_k + nnz_i - 1
             tmp = L_out[worldid, Madr_ki] / L_out[worldid, rowadr_k + M_rownnz[k] - 1]
             for j in range(nnz_i):
               L_out[worldid, rowadr_i + j] = L_out[worldid, rowadr_i + j] - L_out[worldid, rowadr_k + j] * tmp
             L_out[worldid, Madr_ki] = tmp
-          # row i is final: its updates into the rows of ancestor chains (shared with sibling chains: atomics)
+        # phase 2: every row's updates into the rows of ancestor chains (shared with sibling chains: atomics),
+        # deepest target first as the serial kernel; the shallow columns read here are still raw
+        for r in range(r0, r1):
+          i = chain_rows[r]
+          rowadr_i = M_rowadr[i]
           sa = src_adr[i]
           ci = sa[2]
-          diag_i = rowadr_i + nnz_i - 1
-          for u in range(sa[0], sa[1]):
+          diag_i = rowadr_i + M_rownnz[i] - 1
+          for u in range(sa[1] - 1, sa[0] - 1, -1):
             up = updates_bysrc[u]
             t = up[0]
             if src_adr[t][2] == ci:
