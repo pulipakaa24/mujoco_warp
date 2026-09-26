@@ -2121,11 +2121,12 @@ def _update_gradient_h_incremental_sparse(compact: bool):
 # their curvature terms (_update_gradient_JTCJ_cone_list, verbatim), so the cone list launch also goes; with
 # MJW_METAL_FUSE_HTOT=1 the 32 lanes also apply the flipped-row deltas to h and write h + cone term into htot
 # (_update_gradient_JTCJ_dense_world2_htot's per-entry arithmetic, one entry per lane iteration instead of one
-# thread per (world, entry)). Elliptic: 11 -> 6 launches per iteration (5 with the htot fusion).
+# thread per (world, entry); default on: the (nworld, 946)-thread launch 20x per substep measured 15 ms of a 76 ms G1
+# step, MJW_METAL_FUSE_HTOT=0 restores it). Elliptic: 11 -> 5 launches per iteration (6 without the htot fusion).
 # MJW_METAL_FUSE_UPDATE_CPU=1 takes the fused kernels on the CPU device (tests).
 _METAL_FUSE_UPDATE = os.environ.get("MJW_METAL_FUSE_UPDATE", "1") != "0"
 _METAL_FUSE_UPDATE_CPU = os.environ.get("MJW_METAL_FUSE_UPDATE_CPU", "0") == "1"
-_METAL_FUSE_HTOT = os.environ.get("MJW_METAL_FUSE_HTOT", "0") == "1"
+_METAL_FUSE_HTOT = os.environ.get("MJW_METAL_FUSE_HTOT", "1") != "0"
 
 
 def _fuse_update(m: types.Model, ctx) -> bool:
