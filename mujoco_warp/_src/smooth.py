@@ -1230,6 +1230,168 @@ def _qLDiag_div(
 # per-level barriers and the 6 root levels with one to six busy lanes cost more than the shorter dependency chain
 # saves), G1 step 72.7 vs 69.9 ms; kept behind MJW_METAL_LDL_LANES=1 for A/B.
 _METAL_LDL_LANES = os.environ.get("MJW_METAL_LDL_LANES", "0") == "1"
+# "chains" (MJW_METAL_LDL_CHAINS, default 1): one lane per single-child chain of the dof tree per level (height),
+# one world per SIMD group. The solve keeps the serial kernel's summation order (bitwise); the factorization's
+# updates into rows of other chains are atomic (the order in which chains of one level hit a shared ancestor row
+# is arbitrary: float noise, as upstream's CUDA _qLD_acc), updates within a chain keep the serial order.
+_METAL_LDL_CHAINS = os.environ.get("MJW_METAL_LDL_CHAINS", "1") != "0"
+
+
+@cache_kernel
+def _factor_i_sparse_chains(nlevels: int, nM: int):
+  """Sparse L'*D*L factorization, one world per SIMD group, one lane per single-child chain per level (Metal).
+
+  Levels bottom-up (leaf chains first). A chain's lane takes its rows from the deepest up; for each row i it
+  first applies the updates from its own chain's deeper rows (sources ascending: the serial kernel's order for
+  that target, bitwise), then, once row i is final, applies row i's updates into the rows of ancestor chains
+  with atomics (those rows are shared with the sibling chains of this level). A barrier per level.
+  """
+  NLEVELS = nlevels
+  NM = nM
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    # In:
+    chain_rows: wp.array[int],
+    chain_adr: wp.array[wp.vec2i],
+    chain_level_offsets: wp.array[int],
+    updates_bysrc: wp.array[wp.vec3i],
+    src_adr: wp.array[wp.vec3i],
+    M_in: wp.array2d[float],
+    # Out:
+    L_out: wp.array2d[float],
+    D_out: wp.array2d[float],
+  ):
+    worldid, lane = wp.tid()
+    for e in range(lane, wp.static(NM), wp.block_dim()):
+      L_out[worldid, e] = M_in[worldid, e]
+    _syncthreads()
+    for level in range(wp.static(NLEVELS)):
+      c1 = chain_level_offsets[level + 1]
+      for c in range(chain_level_offsets[level] + lane, c1, wp.block_dim()):
+        adr = chain_adr[c]
+        r0 = adr[0]
+        r1 = adr[1]
+        for r in range(r0, r1):
+          i = chain_rows[r]
+          rowadr_i = M_rowadr[i]
+          nnz_i = M_rownnz[i]
+          # updates into row i from the chain's deeper rows, sources ascending
+          for rk in range(r - 1, r0 - 1, -1):
+            k = chain_rows[rk]
+            rowadr_k = M_rowadr[k]
+            # entry (k, i): row k's column i sits at position nnz_i - 1 of row k (same ancestor prefix)
+            Madr_ki = rowadr_k + nnz_i - 1
+            tmp = L_out[worldid, Madr_ki] / L_out[worldid, rowadr_k + M_rownnz[k] - 1]
+            for j in range(nnz_i):
+              L_out[worldid, rowadr_i + j] = L_out[worldid, rowadr_i + j] - L_out[worldid, rowadr_k + j] * tmp
+            L_out[worldid, Madr_ki] = tmp
+          # row i is final: its updates into the rows of ancestor chains (shared with sibling chains: atomics)
+          sa = src_adr[i]
+          ci = sa[2]
+          diag_i = rowadr_i + nnz_i - 1
+          for u in range(sa[0], sa[1]):
+            up = updates_bysrc[u]
+            t = up[0]
+            if src_adr[t][2] == ci:
+              continue
+            Madr_it = up[2]
+            tmp = L_out[worldid, Madr_it] / L_out[worldid, diag_i]
+            rowadr_t = M_rowadr[t]
+            for j in range(M_rownnz[t]):
+              wp.atomic_sub(L_out[worldid], rowadr_t + j, L_out[worldid, rowadr_i + j] * tmp)
+            L_out[worldid, Madr_it] = tmp
+      _syncthreads()
+    for dofid in range(lane, D_out.shape[1], wp.block_dim()):
+      D_out[worldid, dofid] = 1.0 / L_out[worldid, M_rowadr[dofid] + M_rownnz[dofid] - 1]
+
+  return kernel
+
+
+@cache_kernel
+def _solve_LD_sparse_chains(nv: int, nlevels: int):
+  """_solve_LD_sparse_serial with one lane per chain per level (Metal), bitwise the serial order.
+
+  Forward substitution (levels bottom-up): a chain's lane takes its rows from the deepest up and applies each
+  row's updates in list order (sources ascending, the serial order for that target; sources in child chains are
+  final after the previous level's barrier). Backward substitution (levels top-down): each row subtracts its
+  ancestors' contributions root-most first (the serial order for that target).
+  """
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    chain_rows: wp.array[int],
+    chain_adr: wp.array[wp.vec2i],
+    chain_level_offsets: wp.array[int],
+    updates_byrow: wp.array[wp.vec3i],
+    lane_rows: wp.array[wp.vec3i],
+    row_adr: wp.array[int],
+    updates_bysrc: wp.array[wp.vec3i],
+    src_adr: wp.array[wp.vec3i],
+    y: wp.array2d[float],
+    # Out:
+    x_out: wp.array2d[float],
+  ):
+    worldid, lane = wp.tid()
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    for dofid in range(lane, NV, wp.block_dim()):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, dofid] = y[worldid, dofid]
+    _syncthreads()
+    for level in range(NLEVELS):
+      c1 = chain_level_offsets[level + 1]
+      for c in range(chain_level_offsets[level] + lane, c1, wp.block_dim()):
+        adr = chain_adr[c]
+        for r in range(adr[0], adr[1]):
+          i = chain_rows[r]
+          ra = row_adr[i]
+          if ra >= 0:
+            row = lane_rows[ra]
+            xi = x_out[worldid, i]
+            for u in range(row[1], row[2]):
+              update = updates_byrow[u]
+              xi = xi - L[worldid, update[2]] * x_out[worldid, update[1]]
+            x_out[worldid, i] = xi
+      _syncthreads()
+    for dofid in range(lane, NV, wp.block_dim()):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x_out[worldid, dofid] = x_out[worldid, dofid] * D[worldid, dofid]
+    _syncthreads()
+    for level in range(NLEVELS):
+      level_idx = NLEVELS - 1 - level
+      c1 = chain_level_offsets[level_idx + 1]
+      for c in range(chain_level_offsets[level_idx] + lane, c1, wp.block_dim()):
+        adr = chain_adr[c]
+        for r in range(adr[1] - 1, adr[0] - 1, -1):
+          k = chain_rows[r]
+          sa = src_adr[k]
+          xk = x_out[worldid, k]
+          for u in range(sa[0], sa[1]):
+            update = updates_bysrc[u]
+            xk = xk - L[worldid, update[2]] * x_out[worldid, update[0]]
+          x_out[worldid, k] = xk
+      _syncthreads()
+
+  return kernel
+
+
 
 
 @cache_kernel
@@ -1345,6 +1507,15 @@ def _factor_i_sparse_serial(nlevels: int):
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
   if getattr(wp.get_device(), "is_metal", False):
+    if _METAL_LDL_CHAINS and not _METAL_LDL_LANES:
+      wp.launch_tiled(
+        _factor_i_sparse_chains(len(m.qLD_chain_level_offsets) - 1, m.nM),
+        dim=d.nworld,
+        inputs=[m.M_rownnz, m.M_rowadr, m.qLD_chain_rows, m.qLD_chain_adr, m.qLD_chain_level_offsets, m.qLD_updates_bysrc, m.qLD_src_adr, M],
+        outputs=[L, D],
+        block_dim=32,
+      )
+      return
     if _METAL_LDL_LANES:
       wp.launch_tiled(
         _factor_i_sparse_lanes(len(m.qLD_updates), m.nM),
@@ -3664,6 +3835,16 @@ def _solve_LD_sparse(
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
   nlevels = len(m.qLD_updates)
   if getattr(wp.get_device(), "is_metal", False):
+    if _METAL_LDL_CHAINS and not _METAL_LDL_LANES:
+      wp.launch_tiled(
+        _solve_LD_sparse_chains(m.nv, len(m.qLD_chain_level_offsets) - 1),
+        dim=d.nworld,
+        inputs=[m.qLD_block_adr, L, D, m.qLD_chain_rows, m.qLD_chain_adr, m.qLD_chain_level_offsets, m.qLD_updates_byrow,
+                m.qLD_lane_rows, m.qLD_row_adr, m.qLD_updates_bysrc, m.qLD_src_adr, y],
+        outputs=[x],
+        block_dim=32,
+      )
+      return
     if _METAL_LDL_LANES:
       wp.launch_tiled(
         _solve_LD_sparse_lanes(m.nv, nlevels),

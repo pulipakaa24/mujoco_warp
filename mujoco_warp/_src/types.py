@@ -1538,6 +1538,11 @@ class Model:
     qLD_lane_pair_offsets: start offsets of the pairs per level
     qLD_lane_rows: (target row, first update, one past last update) per level (one entry per row)
     qLD_lane_row_offsets: start offsets of the rows per level
+    qLD_chain_rows: dofs of the single-child chains of the sparse block, deepest first, level by level
+    qLD_chain_adr: (first, one past last) into qLD_chain_rows per chain
+    qLD_chain_level_offsets: chain index offsets per level (leaf chains first)
+    qLD_updates_bysrc: the updates of each source row, root-most target first
+    qLD_src_adr: (first, one past last, chain id) into qLD_updates_bysrc per dof
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2036,6 +2041,12 @@ class Model:
   qLD_lane_pair_offsets: array("nqLD_level_offsets", int)
   qLD_lane_rows: array("nqLD_lane_rows", wp.vec3i)
   qLD_lane_row_offsets: array("nqLD_level_offsets", int)
+  qLD_chain_rows: array("nqLD_chain_rows", int)
+  qLD_chain_adr: array("nqLD_chains", wp.vec2i)
+  qLD_chain_level_offsets: array("nqLD_chain_levels", int)
+  qLD_updates_bysrc: array("nqLD_all_updates", wp.vec3i)
+  qLD_src_adr: array("nv", wp.vec3i)
+  qLD_row_adr: array("nv", int)
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

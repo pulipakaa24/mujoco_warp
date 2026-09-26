@@ -1017,9 +1017,56 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     pair_offsets.append(len(pairs))
     row_offsets.append(len(rows_flat))
   m.qLD_updates_byrow = byrow if byrow else [(0, 0, 0)]
+
+  # Chain-parallel schedule (Metal, smooth._factor_i_sparse_chains / _solve_LD_sparse_chains): the sparse-block dofs
+  # split into maximal single-child chains of the dof tree; a chain's level is its height (leaf chains 0), so the
+  # chains of one level are independent and read only chains of lower levels. One lane per chain per level:
+  #   qLD_chain_rows: dof ids of every chain, deepest first, concatenated; qLD_chain_adr: (first, one past last) per chain
+  #   qLD_chain_level_offsets: chains are stored level by level; offsets per level
+  #   qLD_updates_bysrc: the updates of each source row k, root-most target first (the backward solve's order);
+  #   qLD_src_adr: (first, one past last, chain id of the source row) per dof (-1 for dofs outside the sparse block)
+  chain_of = np.full(mjm.nv, -1, dtype=int)
+  chains = []
+  for k in range(mjm.nv):
+    if _lay["dof_adr"][k] != types.Q_LD_BLOCK_SPARSE:
+      continue
+    p = mjm.dof_parentid[k]
+    single = p >= 0 and chain_of[p] >= 0 and sum(1 for c in range(mjm.nv) if mjm.dof_parentid[c] == p) == 1
+    if single:
+      chain_of[k] = chain_of[p]; chains[chain_of[k]].append(k)
+    else:
+      chain_of[k] = len(chains); chains.append([k])
+  height = [0] * len(chains)
+  for ci in reversed(range(len(chains))):
+    top = chains[ci][0]; p = mjm.dof_parentid[top]
+    if p >= 0 and chain_of[p] >= 0:
+      height[chain_of[p]] = max(height[chain_of[p]], height[ci] + 1)
+  order = sorted(range(len(chains)), key=lambda ci: (height[ci], ci))
+  chain_rows, chain_adr, level_off, lvl = [], [], [0], 0
+  for ci in order:
+    while height[ci] > lvl:
+      level_off.append(len(chain_adr)); lvl += 1
+    chain_adr.append((len(chain_rows), len(chain_rows) + len(chains[ci])))
+    chain_rows.extend(reversed(chains[ci]))          # deepest row first
+  level_off.append(len(chain_adr))
+  bysrc, src_adr = [], []
+  for k in range(mjm.nv):
+    ups = [u for lvl_ups in sparse_updates.values() for u in lvl_ups if u[1] == k]
+    ups.sort(key=lambda u: u[0])                       # root-most target first
+    src_adr.append((len(bysrc), len(bysrc) + len(ups), int(chain_of[k])))
+    bysrc.extend(ups)
+  m.qLD_chain_rows = chain_rows if chain_rows else [0]
+  m.qLD_chain_adr = chain_adr if chain_adr else [(0, 0)]
+  m.qLD_chain_level_offsets = level_off
+  m.qLD_updates_bysrc = bysrc if bysrc else [(0, 0, 0)]
+  m.qLD_src_adr = src_adr
   m.qLD_lane_pairs = pairs if pairs else [(-1, 0, 0, 0)]
   m.qLD_lane_pair_offsets = pair_offsets
   m.qLD_lane_rows = rows_flat if rows_flat else [(0, 0, 0)]
+  row_adr = [-1] * mjm.nv
+  for idx, (i, _, _) in enumerate(rows_flat):
+    row_adr[int(i)] = idx
+  m.qLD_row_adr = row_adr                         # index into qLD_lane_rows per target dof (-1 when it has no updates)
   m.qLD_lane_row_offsets = row_offsets
 
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
@@ -1232,6 +1279,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nqLD_all_updates": len(m.qLD_all_updates),
       "nqLD_level_offsets": len(m.qLD_level_offsets),
       "nqLD_lane_pairs": len(m.qLD_lane_pairs),
+      "nqLD_chain_rows": len(m.qLD_chain_rows),
+      "nqLD_chains": len(m.qLD_chain_adr),
+      "nqLD_chain_levels": len(m.qLD_chain_level_offsets),
       "nqLD_lane_rows": len(m.qLD_lane_rows),
       "nM_fullm": len(m.M_fullm_i),
       "nM_fullm_upper": len(m.M_fullm_upper_i),
