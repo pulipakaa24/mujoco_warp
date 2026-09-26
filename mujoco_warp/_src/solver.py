@@ -3455,7 +3455,7 @@ def _launch_htot_cholesky(m: types.Model, d: types.Data, ctx: SolverContext, ski
     dim=d.nworld,
     inputs=[ctx.grad, ctx.htot, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
     outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
-    block_dim=m.block_dim.update_gradient_cholesky if wp.get_device().is_cuda else 32,
+    block_dim=m.block_dim.update_gradient_cholesky if wp.get_device().is_cuda else _METAL_CHOL_LANES,
   )
 
 
@@ -3577,6 +3577,9 @@ _JTCJ_SM_FACTOR = int(os.environ.get("MJW_JTCJ_SM_FACTOR", "6"))
 # Off CUDA, Newton Hessians up to this size use the single dense (register) tile Cholesky, larger ones the
 # blocked factorization (MJW_METAL_DENSE_CHOL_MAX overrides, for A/B measurements)
 _DENSE_CHOL_MAX_OFF_CUDA = int(os.environ.get("MJW_METAL_DENSE_CHOL_MAX", "64"))
+# Lanes per world for the Newton Hessian Cholesky launches on Metal: 32 (one SIMD group, the register form) or 64
+# (two SIMD groups, one column per lane; Warp fork metal_register_cholesky64). MJW_METAL_CHOL_LANES=64 to A/B.
+_METAL_CHOL_LANES = int(os.environ.get("MJW_METAL_CHOL_LANES", "32"))
 
 
 def _fuse_h_cholesky() -> bool:
@@ -3820,7 +3823,7 @@ def _cholesky_factorize_solve(
       inputs=[ctx.grad, ctx.h, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
       outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
       # one SIMD group per world keeps the factorization in registers off CUDA
-      block_dim=m.block_dim.update_gradient_cholesky if wp.get_device().is_cuda else 32,
+      block_dim=m.block_dim.update_gradient_cholesky if wp.get_device().is_cuda else _METAL_CHOL_LANES,
     )
   else:
     wp.launch(
@@ -4312,7 +4315,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
             ctx.hc,
           ],
           outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
-          block_dim=32,
+          block_dim=_METAL_CHOL_LANES,
         )
         return
       elif mode == "world2":
@@ -4455,7 +4458,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
         ctx.hc,
       ],
       outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
-      block_dim=32,
+      block_dim=_METAL_CHOL_LANES,
     )
     return
   else:

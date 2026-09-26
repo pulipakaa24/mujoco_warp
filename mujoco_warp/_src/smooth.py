@@ -1467,6 +1467,145 @@ def _factor_i_sparse_lanes(nlevels: int, nM: int):
   return kernel
 
 
+# "unrolled" (MJW_METAL_LDL_UNROLLED, default 1 on Metal): a per-model native snippet, one world per SIMD group, lane j
+# holding position j of every row of the factor in registers (rows are compile-time indices), the update list as
+# straight-line code with two SIMD shuffles per update and no barriers or threadgroup memory. The same operations in
+# the same order as the serial kernel (bitwise). Falls back to the serial kernels above 32 entries per row.
+_METAL_LDL_UNROLLED = os.environ.get("MJW_METAL_LDL_UNROLLED", "1") != "0"
+_LDL_SCHEDULES: dict = {}
+
+
+def _ldl_schedule(m: Model):
+  """(key, rowadr, rownnz, updates in the serial order) of the sparse block's L'DL, cached per model layout."""
+  rowadr = tuple(int(x) for x in m.M_rowadr.numpy())
+  rownnz = tuple(int(x) for x in m.M_rownnz.numpy())
+  ups = m.qLD_all_updates.numpy()
+  off = m.qLD_level_offsets.numpy()
+  order = []
+  for level in range(len(off) - 2, -1, -1):        # deepest target level first, list order within (the serial kernel)
+    for u in range(int(off[level]), int(off[level + 1])):
+      order.append((int(ups[u][0]), int(ups[u][1]), int(ups[u][2])))
+  back = []
+  for level in range(len(off) - 1):                # the serial backward pass: shallow target levels first, list order
+    for u in range(int(off[level]), int(off[level + 1])):
+      back.append((int(ups[u][0]), int(ups[u][1]), int(ups[u][2])))
+  sparse = tuple(int(x) == Q_LD_BLOCK_SPARSE for x in m.qLD_block_adr.numpy())
+  key = hash((rowadr, rownnz, tuple(order), sparse, m.nv, m.nM))
+  _LDL_SCHEDULES[key] = (rowadr, rownnz, order, back, sparse, m.nv, m.nM)
+  return key
+
+
+def _ldl_unrolled_source(key: int, solve: bool) -> str:
+  rowadr, rownnz, order, back, sparse, nv, nM = _LDL_SCHEDULES[key]
+  L = []
+  if not solve:
+    # factor: reg[i] = M[rowadr[i] + lane] for lane < rownnz[i]
+    L.append("#if defined(__METAL_VERSION__)")
+    L.append(f"thread float reg[{nv}];")
+    for i in range(nv):
+      L.append(f"reg[{i}] = (lane < {rownnz[i]}) ? M_in.data[{rowadr[i]} + lane] : 0.0f;")
+    for (i, k, madr_ki) in order:
+      pki = madr_ki - rowadr[k]            # position of column i within row k (= rownnz[i] - 1)
+      pkk = rownnz[k] - 1
+      L.append("{")
+      L.append(f"  const float lki = metal::simd_shuffle(reg[{k}], ushort({pki}));")
+      L.append(f"  const float lkk = metal::simd_shuffle(reg[{k}], ushort({pkk}));")
+      L.append("  const float tmp = lki / lkk;")
+      L.append(f"  if (lane < {rownnz[i]}) reg[{i}] = reg[{i}] - reg[{k}] * tmp;")
+      L.append(f"  if (lane == {pki}) reg[{k}] = tmp;")
+      L.append("}")
+    for i in range(nv):
+      L.append(f"if (lane < {rownnz[i]}) L_out.data[{rowadr[i]} + lane] = reg[{i}];")
+    for i in range(nv):
+      if sparse[i]:
+        L.append(f"if (lane == {rownnz[i] - 1}) D_out.data[{i}] = 1.0f / reg[{i}];")
+    L.append("#else")
+    # scalar fallback (CPU builds): the serial kernel's loop on the arrays
+    L.append(f"for (int e = 0; e < {nM}; ++e) L_out.data[e] = M_in.data[e];")
+    for (i, k, madr_ki) in order:
+      L.append(f"{{ const float tmp = L_out.data[{madr_ki}] / L_out.data[{rowadr[k] + rownnz[k] - 1}];")
+      L.append(f"  for (int j = 0; j < {rownnz[i]}; ++j) L_out.data[{rowadr[i]} + j] = L_out.data[{rowadr[i]} + j] - L_out.data[{rowadr[k]} + j] * tmp;")
+      L.append(f"  L_out.data[{madr_ki}] = tmp; }}")
+    for i in range(nv):
+      if sparse[i]:
+        L.append(f"D_out.data[{i}] = 1.0f / L_out.data[{rowadr[i] + rownnz[i] - 1}];")
+    L.append("#endif")
+  else:
+    # solve: x replicated in every lane; L entries broadcast from the lane holding them
+    L.append("#if defined(__METAL_VERSION__)")
+    L.append(f"thread float reg[{nv}];")
+    L.append(f"thread float x[{nv}];")
+    for i in range(nv):
+      L.append(f"reg[{i}] = (lane < {rownnz[i]}) ? L_in.data[{rowadr[i]} + lane] : 0.0f;")
+    for i in range(nv):
+      L.append(f"x[{i}] = {'y_in.data[%d]' % i if sparse[i] else '0.0f'};")
+    for (i, k, madr_ki) in order:                       # forward: x[i] -= L[k, i] x[k], serial order
+      pki = madr_ki - rowadr[k]
+      L.append(f"x[{i}] = x[{i}] - metal::simd_shuffle(reg[{k}], ushort({pki})) * x[{k}];")
+    for i in range(nv):
+      if sparse[i]:
+        L.append(f"x[{i}] = x[{i}] * D_in.data[{i}];")
+    for (i, k, madr_ki) in back:                         # backward: x[k] -= L[k, i] x[i], the serial kernel's order
+      pki = madr_ki - rowadr[k]
+      L.append(f"x[{k}] = x[{k}] - metal::simd_shuffle(reg[{k}], ushort({pki})) * x[{i}];")
+    for i in range(nv):
+      if sparse[i]:
+        L.append(f"if (lane == 0) x_out.data[{i}] = x[{i}];")
+    L.append("#else")
+    L.append(f"for (int i = 0; i < {nv}; ++i) x_out.data[i] = y_in.data[i];")
+    for (i, k, madr_ki) in order:
+      L.append(f"x_out.data[{i}] = x_out.data[{i}] - L_in.data[{madr_ki}] * x_out.data[{k}];")
+    for i in range(nv):
+      if sparse[i]:
+        L.append(f"x_out.data[{i}] = x_out.data[{i}] * D_in.data[{i}];")
+    for (i, k, madr_ki) in back:
+      L.append(f"x_out.data[{k}] = x_out.data[{k}] - L_in.data[{madr_ki}] * x_out.data[{i}];")
+    L.append("#endif")
+  return "\n".join(L) + "\n"   # Warp appends the closing brace right after the snippet
+
+
+@cache_kernel
+def _factor_i_sparse_unrolled(key: int):
+  src = _ldl_unrolled_source(key, solve=False)
+
+  @wp.func_native(snippet=src)
+  def body(M_in: wp.array[float], L_out: wp.array[float], D_out: wp.array[float], lane: int):
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(M_in: wp.array2d[float], L_out: wp.array2d[float], D_out: wp.array2d[float]):
+    worldid, lane = wp.tid()
+    body(M_in[worldid], L_out[worldid], D_out[worldid], lane)
+
+  return kernel
+
+
+@cache_kernel
+def _solve_LD_sparse_unrolled(key: int):
+  src = _ldl_unrolled_source(key, solve=True)
+
+  @wp.func_native(snippet=src)
+  def body(L_in: wp.array[float], D_in: wp.array[float], y_in: wp.array[float], x_out: wp.array[float], lane: int):
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(L_in: wp.array2d[float], D_in: wp.array2d[float], y_in: wp.array2d[float], x_out: wp.array2d[float]):
+    worldid, lane = wp.tid()
+    body(L_in[worldid], D_in[worldid], y_in[worldid], x_out[worldid], lane)
+
+  return kernel
+
+
+def _ldl_unrolled_ok(m: Model) -> bool:
+  return (
+    _METAL_LDL_UNROLLED
+    and getattr(wp.get_device(), "is_metal", False)
+    and m.nv <= 64
+    and int(m.M_rownnz.numpy().max()) <= 32
+    and len(m.qLD_all_updates) > 0
+  )
+
+
 @cache_kernel
 def _factor_i_sparse_serial(nlevels: int):
   """Whole sparse L'*D*L factorization of one world per thread (Metal).
@@ -1514,6 +1653,9 @@ def _factor_i_sparse_serial(nlevels: int):
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
   if getattr(wp.get_device(), "is_metal", False):
+    if _ldl_unrolled_ok(m) and not (_METAL_LDL_CHAINS or _METAL_LDL_LANES):
+      wp.launch_tiled(_factor_i_sparse_unrolled(_ldl_schedule(m)), dim=d.nworld, inputs=[M], outputs=[L, D], block_dim=32)
+      return
     if _METAL_LDL_CHAINS and not _METAL_LDL_LANES:
       wp.launch_tiled(
         _factor_i_sparse_chains(len(m.qLD_chain_level_offsets) - 1, m.nM),
@@ -3842,6 +3984,9 @@ def _solve_LD_sparse(
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
   nlevels = len(m.qLD_updates)
   if getattr(wp.get_device(), "is_metal", False):
+    if _ldl_unrolled_ok(m) and not (_METAL_LDL_CHAINS or _METAL_LDL_LANES):
+      wp.launch_tiled(_solve_LD_sparse_unrolled(_ldl_schedule(m)), dim=d.nworld, inputs=[L, D, y], outputs=[x], block_dim=32)
+      return
     if _METAL_LDL_CHAINS and not _METAL_LDL_LANES:
       wp.launch_tiled(
         _solve_LD_sparse_chains(m.nv, len(m.qLD_chain_level_offsets) - 1),
