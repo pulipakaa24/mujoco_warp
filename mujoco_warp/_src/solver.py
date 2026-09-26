@@ -84,7 +84,8 @@ def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
   # two-pass elliptic cone term (dense Newton only): at most njmax // 3 cone contacts per world (condim >= 3)
-  alloc_cone_list = alloc_h and m.opt.cone == types.ConeType.ELLIPTIC and not m.is_sparse and _JTCJ_MODE == "world2"
+  alloc_ell_inc = alloc_h and _elliptic_incremental(m)
+  alloc_cone_list = alloc_h and m.opt.cone == types.ConeType.ELLIPTIC and not m.is_sparse and (_JTCJ_MODE == "world2" or alloc_ell_inc)
   ncone_max = max(1, njmax // 3)
 
   return SolverContext(
@@ -115,6 +116,8 @@ def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
     cone_count=wp.empty((nworld,), dtype=int) if alloc_cone_list else wp.empty((0,), dtype=int),
     cone_efcid=wp.empty((nworld, ncone_max), dtype=int) if alloc_cone_list else wp.empty((nworld, 0), dtype=int),
     cone_terms=wp.empty((nworld, ncone_max), dtype=types.vec16) if alloc_cone_list else wp.empty((nworld, 0), dtype=types.vec16),
+    hc=wp.empty((nworld, nv_pad, nv_pad), dtype=float) if alloc_ell_inc else wp.empty((nworld, 0, 0), dtype=float),
+    htot=wp.zeros((nworld, nv_pad, nv_pad), dtype=float) if alloc_ell_inc and _ELLIPTIC_INCREMENTAL_MODE == 2 else wp.empty((nworld, 0, 0), dtype=float),
   )
 
 
@@ -1831,7 +1834,9 @@ def _update_constraint_efc(track_changes: bool):
         quad_changed_ids_out[worldid, idx] = efcid
       # LINEARNEG <-> LINEARPOS friction transitions change the force without
       # changing the quadratic flag (or H); the fast path must still see them.
-      if old_state != new_state:
+      # A CONE-state row changes H every iteration (its curvature depends on
+      # Jaref), so its world never takes the stable-state fast path.
+      if old_state != new_state or new_state == types.ConstraintState.CONE.value:
         wp.atomic_add(state_changed_count_out, worldid, 1)
 
   return kernel
@@ -2927,39 +2932,131 @@ def _update_gradient_JTCJ_cone_list(
   cone_count_out[worldid] = count
 
 
+@cache_kernel
+def _update_gradient_JTCJ_dense_world2(accumulate: bool):
+  ACCUMULATE = accumulate
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    dof_tri_row: wp.array[int],
+    dof_tri_col: wp.array[int],
+    # Data in:
+    efc_J_in: wp.array3d[float],
+    # In:
+    cone_count_in: wp.array[int],
+    cone_efcid_in: wp.array2d[int],
+    cone_terms_in: wp.array2d[types.vec16],
+    ctx_done_in: wp.array[bool],
+    # Out:
+    ctx_h_out: wp.array3d[float],
+  ):
+    """Pass 2: one thread per (world, Hessian entry) over the world's cone list (same arithmetic and
+    order as _update_gradient_JTCJ_dense_world). accumulate: add to h; else store the term (ctx.hc)."""
+    worldid, elementid = wp.tid()
+    if ctx_done_in[worldid]:
+      return
+    dof1id = dof_tri_row[elementid]
+    dof2id = dof_tri_col[elementid]
+    hsum = float(0.0)
+    for k in range(cone_count_in[worldid]):
+      efcid0 = cone_efcid_in[worldid, k]
+      terms = cone_terms_in[worldid, k]
+      mu = terms[6]
+      z01 = mu * efc_J_in[worldid, efcid0, dof1id]
+      z02 = mu * efc_J_in[worldid, efcid0, dof2id]
+      projection1 = float(0.0)
+      projection2 = float(0.0)
+      tangent_dot = float(0.0)
+      nrows = int(terms[0])
+      for dim in range(1, nrows):
+        efcid = efcid0 + dim
+        scale = terms[6 + dim]
+        u = terms[dim]
+        z1 = scale * efc_J_in[worldid, efcid, dof1id]
+        z2 = scale * efc_J_in[worldid, efcid, dof2id]
+        projection1 += u * z1
+        projection2 += u * z2
+        tangent_dot += z1 * z2
+      hsum += _elliptic_hessian_entry_from_projections(
+        terms[12], terms[13], terms[14], terms[15], z01, z02, projection1, projection2, tangent_dot
+      )
+    if wp.static(ACCUMULATE):
+      if hsum != 0.0:
+        ctx_h_out[worldid, dof1id, dof2id] = ctx_h_out[worldid, dof1id, dof2id] + hsum
+    else:
+      ctx_h_out[worldid, dof1id, dof2id] = hsum
+
+  return kernel
+
+
 @wp.kernel
-def _update_gradient_JTCJ_dense_world2(
+def _update_gradient_JTCJ_dense_world2_htot(
   # Model:
   dof_tri_row: wp.array[int],
   dof_tri_col: wp.array[int],
   # Data in:
   efc_J_in: wp.array3d[float],
+  efc_D_in: wp.array2d[float],
+  efc_state_in: wp.array2d[int],
   # In:
+  quad_changed_ids_in: wp.array2d[int],
+  quad_changed_count_in: wp.array[int],
   cone_count_in: wp.array[int],
   cone_efcid_in: wp.array2d[int],
   cone_terms_in: wp.array2d[types.vec16],
   ctx_done_in: wp.array[bool],
-  # Out:
+  # In/out:
   ctx_h_out: wp.array3d[float],
+  # Out:
+  ctx_htot_out: wp.array3d[float],
 ):
-  """Pass 2: one thread per (world, Hessian entry) over the world's cone list (same arithmetic and
-  order as _update_gradient_JTCJ_dense_world)."""
+  """One thread per (world, upper-triangle entry): apply the flipped-row deltas to h (the incremental
+  M + J'DJ over QUADRATIC rows, as _update_gradient_h_incremental) and write h + the cone term to htot."""
   worldid, elementid = wp.tid()
   if ctx_done_in[worldid]:
     return
   dof1id = dof_tri_row[elementid]
   dof2id = dof_tri_col[elementid]
+  n_changes = quad_changed_count_in[worldid]
+  h = ctx_h_out[worldid, dof1id, dof2id]
+  if n_changes > 0:
+    delta = float(0.0)
+    for change_idx in range(n_changes):
+      efcid = quad_changed_ids_in[worldid, change_idx]
+      Jrow = efc_J_in[worldid, efcid, dof1id]
+      if Jrow == 0.0:
+        continue
+      Jcol = efc_J_in[worldid, efcid, dof2id]
+      if Jcol == 0.0:
+        continue
+      D = efc_D_in[worldid, efcid]
+      if efc_state_in[worldid, efcid] == types.ConstraintState.QUADRATIC.value:
+        delta += D * Jrow * Jcol
+      else:
+        delta -= D * Jrow * Jcol
+    if delta != 0.0:
+      h += delta
+      ctx_h_out[worldid, dof1id, dof2id] = h
   hsum = float(0.0)
   for k in range(cone_count_in[worldid]):
     efcid0 = cone_efcid_in[worldid, k]
     terms = cone_terms_in[worldid, k]
+    nrows = int(terms[0])
+    if wp.static(_CONE_SKIP_ZERO):
+      # every term of the entry carries a factor from the contact's rows at dof1: skip when they are all zero
+      nz = int(0)
+      for dim in range(nrows):
+        if efc_J_in[worldid, efcid0 + dim, dof1id] != 0.0:
+          nz = 1
+      if nz == 0:
+        continue
     mu = terms[6]
     z01 = mu * efc_J_in[worldid, efcid0, dof1id]
     z02 = mu * efc_J_in[worldid, efcid0, dof2id]
     projection1 = float(0.0)
     projection2 = float(0.0)
     tangent_dot = float(0.0)
-    nrows = int(terms[0])
     for dim in range(1, nrows):
       efcid = efcid0 + dim
       scale = terms[6 + dim]
@@ -2972,8 +3069,90 @@ def _update_gradient_JTCJ_dense_world2(
     hsum += _elliptic_hessian_entry_from_projections(
       terms[12], terms[13], terms[14], terms[15], z01, z02, projection1, projection2, tangent_dot
     )
-  if hsum != 0.0:
-    ctx_h_out[worldid, dof1id, dof2id] = ctx_h_out[worldid, dof1id, dof2id] + hsum
+  ctx_htot_out[worldid, dof1id, dof2id] = h + hsum
+
+
+def _launch_cone_htot(m: types.Model, d: types.Data, ctx: SolverContext):
+  """MJW_ELLIPTIC_INCREMENTAL=2: cone list, then deltas + cone term into htot."""
+  wp.launch(
+    _update_gradient_JTCJ_cone_list,
+    dim=d.nworld,
+    inputs=[
+      m.opt.impratio_invsqrt,
+      d.contact.friction,
+      d.contact.dim,
+      d.contact.efc_address,
+      d.nefc,
+      d.efc.type,
+      d.efc.id,
+      d.efc.D,
+      d.efc.state,
+      d.njmax,
+      ctx.cone_efcid.shape[1],
+      ctx.Jaref,
+      ctx.done,
+    ],
+    outputs=[ctx.cone_count, ctx.cone_efcid, ctx.cone_terms],
+  )
+  wp.launch(
+    _update_gradient_JTCJ_dense_world2_htot,
+    dim=(d.nworld, m.dof_tri_row.size),
+    inputs=[
+      m.dof_tri_row,
+      m.dof_tri_col,
+      d.efc.J,
+      d.efc.D,
+      d.efc.state,
+      ctx.quad_changed_ids,
+      ctx.quad_changed_count,
+      ctx.cone_count,
+      ctx.cone_efcid,
+      ctx.cone_terms,
+      ctx.done,
+      ctx.h,
+    ],
+    outputs=[ctx.htot],
+  )
+
+
+def _launch_htot_cholesky(m: types.Model, d: types.Data, ctx: SolverContext, skip_noflip: bool):
+  wp.launch_tiled(
+    _update_gradient_cholesky(m.nv, skip_noflip),
+    dim=d.nworld,
+    inputs=[ctx.grad, ctx.htot, ctx.state_changed_count if skip_noflip else d.nefc, ctx.done],
+    outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
+    block_dim=m.block_dim.update_gradient_cholesky if wp.get_device().is_cuda else 32,
+  )
+
+
+def _launch_cone_term(m: types.Model, d: types.Data, ctx: SolverContext, out: wp.array3d, accumulate: bool):
+  """The elliptic cone contacts' Hessian term (two passes, see _update_gradient_JTCJ_cone_list)."""
+  wp.launch(
+    _update_gradient_JTCJ_cone_list,
+    dim=d.nworld,
+    inputs=[
+      m.opt.impratio_invsqrt,
+      d.contact.friction,
+      d.contact.dim,
+      d.contact.efc_address,
+      d.nefc,
+      d.efc.type,
+      d.efc.id,
+      d.efc.D,
+      d.efc.state,
+      d.njmax,
+      ctx.cone_efcid.shape[1],
+      ctx.Jaref,
+      ctx.done,
+    ],
+    outputs=[ctx.cone_count, ctx.cone_efcid, ctx.cone_terms],
+  )
+  wp.launch(
+    _update_gradient_JTCJ_dense_world2(accumulate),
+    dim=(d.nworld, m.dof_tri_row.size),
+    inputs=[m.dof_tri_row, m.dof_tri_col, d.efc.J, ctx.cone_count, ctx.cone_efcid, ctx.cone_terms, ctx.done],
+    outputs=[out],
+  )
 
 
 @cache_kernel
@@ -3035,6 +3214,23 @@ _JTCJ_MODE = os.environ.get("MJW_JTCJ_MODE", "world2")
 # (1 = the fork's previous one-lane groups; 32 = full groups with per-lane cone terms) and constraint
 # groups processed in parallel per world (0 = automatic: Warp's occupancy query, which is 1 off CUDA).
 _JTDAJ_ELLIPTIC_LANES = int(os.environ.get("MJW_JTDAJ_ELLIPTIC_LANES", "32"))
+# Elliptic cones on the incremental Newton path (dense Jacobian, fused register Cholesky): H = M + J'DJ over
+# QUADRATIC rows is kept and updated by the rows that flipped QUADRATIC state (as for pyramidal cones), and the
+# cone contacts' curvature term is rebuilt every iteration into ctx.hc (it depends on Jaref) and added inside the
+# fused Cholesky launch. This is MuJoCo C's structure (engine_solver.c: HessianIncremental keeps L up to date with
+# rank-1 updates for QUADRATIC flips; HessianCone re-adds every CONE-state contact to a copy of L each iteration).
+# 0 = the previous form: full J'DJ rebuild + cone term + separate Cholesky every iteration.
+# 1: the cone term (ctx.hc) is added to h inside the fused Cholesky launch (one extra tile load per world);
+# 2: the per-entry cone kernel also applies the flipped-row deltas to h and writes h + cone into ctx.htot, which
+#    the plain register Cholesky factorizes (no per-lane delta loop, one tile load).
+_ELLIPTIC_INCREMENTAL_MODE = int(os.environ.get("MJW_ELLIPTIC_INCREMENTAL", "2"))
+# cone-term kernels: skip an entry's contact when the contact's Jacobian rows are zero at the entry's first dof
+# (every term of the entry is then zero); measured 1-2 % slower on every model (the test loads cost more than the
+# skipped ones), so the default is 0 = evaluate every contact for every entry; 1 restores the skip (same result)
+_CONE_SKIP_ZERO = os.environ.get("MJW_CONE_SKIP_ZERO", "0") == "1"
+_ELLIPTIC_INCREMENTAL = _ELLIPTIC_INCREMENTAL_MODE != 0
+# allow the fused register-Cholesky path on the CPU device (tests of the elliptic incremental path without a GPU)
+_FUSE_H_CHOLESKY_CPU = os.environ.get("MJW_FUSE_H_CHOLESKY_CPU", "0") == "1"
 _JTDAJ_GROUPS_PER_WORLD = int(os.environ.get("MJW_JTDAJ_GROUPS_PER_WORLD", "0"))
 _JTCJ_SM_FACTOR = int(os.environ.get("MJW_JTCJ_SM_FACTOR", "6"))
 # Off CUDA, Newton Hessians up to this size use the single dense (register) tile Cholesky, larger ones the
@@ -3043,12 +3239,25 @@ _DENSE_CHOL_MAX_OFF_CUDA = int(os.environ.get("MJW_METAL_DENSE_CHOL_MAX", "64"))
 
 
 def _fuse_h_cholesky() -> bool:
-  return _METAL_FUSE_H_CHOLESKY and getattr(wp.get_device(), "is_metal", False)
+  return _METAL_FUSE_H_CHOLESKY and (getattr(wp.get_device(), "is_metal", False) or (_FUSE_H_CHOLESKY_CPU and wp.get_device().is_cpu))
+
+
+def _elliptic_incremental(m: types.Model) -> bool:
+  """Elliptic cones on the incremental Newton path (dense Jacobian, fused register Cholesky)."""
+  return (
+    _ELLIPTIC_INCREMENTAL
+    and m.opt.solver == types.SolverType.NEWTON
+    and m.opt.cone == types.ConeType.ELLIPTIC
+    and not m.is_sparse
+    and _fuse_h_cholesky()
+    and m.nv <= _DENSE_CHOL_MAX_OFF_CUDA
+  )
 
 
 @cache_kernel
-def _update_gradient_h_incremental_cholesky(tile_size: int, skip_noflip: bool):
+def _update_gradient_h_incremental_cholesky(tile_size: int, skip_noflip: bool, elliptic: bool = False):
   SKIP_NOFLIP = skip_noflip
+  ELLIPTIC = elliptic  # add the cone term ctx.hc (rebuilt every iteration) to h before factorizing
   TRI = tile_size * (tile_size + 1) // 2
 
   @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -3069,6 +3278,8 @@ def _update_gradient_h_incremental_cholesky(tile_size: int, skip_noflip: bool):
     ctx_done_in: wp.array[bool],
     # In/out:
     ctx_h_out: wp.array3d[float],
+    # In:
+    ctx_hc_in: wp.array3d[float],
     # Out:
     ctx_search_out: wp.array2d[float],
     ctx_search_dot_out: wp.array[float],
@@ -3109,6 +3320,8 @@ def _update_gradient_h_incremental_cholesky(tile_size: int, skip_noflip: bool):
         return
 
     mat_tile = wp.tile_load(ctx_h_out[worldid], shape=(TILE_SIZE, TILE_SIZE))
+    if wp.static(ELLIPTIC):
+      mat_tile = wp.tile_map(wp.add, mat_tile, wp.tile_load(ctx_hc_in[worldid], shape=(TILE_SIZE, TILE_SIZE)))
     wp.tile_cholesky_inplace(mat_tile, fill_mode="upper")
     input_tile = wp.tile_load(ctx_grad_in[worldid], shape=TILE_SIZE)
     output_tile = wp.tile_cholesky_solve(mat_tile, input_tile, fill_mode="upper")
@@ -3725,33 +3938,40 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
 
       sm_count = getattr(wp.get_device(), "sm_count", 0)  # 0 on CPU; GPU cores on Metal
       mode = _JTCJ_MODE
-      if mode == "world2":
+      if _elliptic_incremental(m) and getattr(ctx, "hc", None) is not None and ctx.hc.shape[1] > 0:
+        # incremental elliptic path: h keeps M + J'DJ over QUADRATIC rows (just rebuilt above); the cone term
+        # goes to hc and the fused launch factorizes h + hc
         wp.launch(
-          _update_gradient_JTCJ_cone_list,
+          _zero_change_counters,
+          dim=d.nworld,
+          outputs=[ctx.quad_changed_count, ctx.state_changed_count],
+        )
+        if _ELLIPTIC_INCREMENTAL_MODE == 2:
+          _launch_cone_htot(m, d, ctx)
+          _launch_htot_cholesky(m, d, ctx, skip_noflip=False)
+          return
+        _launch_cone_term(m, d, ctx, ctx.hc, accumulate=False)
+        wp.launch_tiled(
+          _update_gradient_h_incremental_cholesky(m.nv, False, True),
           dim=d.nworld,
           inputs=[
-            m.opt.impratio_invsqrt,
-            d.contact.friction,
-            d.contact.dim,
-            d.contact.efc_address,
-            d.nefc,
-            d.efc.type,
-            d.efc.id,
+            d.efc.J,
             d.efc.D,
             d.efc.state,
-            d.njmax,
-            ctx.cone_efcid.shape[1],
-            ctx.Jaref,
+            ctx.quad_changed_ids,
+            ctx.quad_changed_count,
+            ctx.grad,
+            d.nefc,
             ctx.done,
+            ctx.h,
+            ctx.hc,
           ],
-          outputs=[ctx.cone_count, ctx.cone_efcid, ctx.cone_terms],
+          outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
+          block_dim=32,
         )
-        wp.launch(
-          _update_gradient_JTCJ_dense_world2,
-          dim=(d.nworld, m.dof_tri_row.size),
-          inputs=[m.dof_tri_row, m.dof_tri_col, d.efc.J, ctx.cone_count, ctx.cone_efcid, ctx.cone_terms, ctx.done],
-          outputs=[ctx.h],
-        )
+        return
+      elif mode == "world2":
+        _launch_cone_term(m, d, ctx, ctx.h, accumulate=True)
       elif mode == "world":
         wp.launch(
           _update_gradient_JTCJ_dense_world,
@@ -3864,8 +4084,15 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
       outputs=[ctx.h],
     )
   elif _fuse_h_cholesky() and m.nv <= _DENSE_CHOL_MAX_OFF_CUDA:
+    ell = _elliptic_incremental(m)
+    if ell and _ELLIPTIC_INCREMENTAL_MODE == 2:
+      _launch_cone_htot(m, d, ctx)
+      _launch_htot_cholesky(m, d, ctx, skip_noflip=stable_fast)
+      return
+    if ell:
+      _launch_cone_term(m, d, ctx, ctx.hc, accumulate=False)
     wp.launch_tiled(
-      _update_gradient_h_incremental_cholesky(m.nv, stable_fast),
+      _update_gradient_h_incremental_cholesky(m.nv, stable_fast, ell),
       dim=d.nworld,
       inputs=[
         d.efc.J,
@@ -3877,6 +4104,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
         ctx.state_changed_count if stable_fast else d.nefc,
         ctx.done,
         ctx.h,
+        ctx.hc,
       ],
       outputs=[ctx.search, ctx.search_dot, ctx.newton_decrement],
       block_dim=32,
@@ -4078,7 +4306,7 @@ _ALPHA_NOISE_EPS = 8.0 * 1.1920929e-07  # 8 * float32 eps
 
 def _use_incremental(m: types.Model) -> bool:
   """Whether constraint state changes are tracked for incremental H updates."""
-  return m.opt.solver == types.SolverType.NEWTON and m.opt.cone != types.ConeType.ELLIPTIC
+  return m.opt.solver == types.SolverType.NEWTON and (m.opt.cone != types.ConeType.ELLIPTIC or _elliptic_incremental(m))
 
 
 @wp.kernel(grid_stride=True)
