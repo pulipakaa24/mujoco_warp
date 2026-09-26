@@ -1230,11 +1230,14 @@ def _qLDiag_div(
 # per-level barriers and the 6 root levels with one to six busy lanes cost more than the shorter dependency chain
 # saves), G1 step 72.7 vs 69.9 ms; kept behind MJW_METAL_LDL_LANES=1 for A/B.
 _METAL_LDL_LANES = os.environ.get("MJW_METAL_LDL_LANES", "0") == "1"
-# "chains" (MJW_METAL_LDL_CHAINS, default 1): one lane per single-child chain of the dof tree per level (height),
-# one world per SIMD group. The solve keeps the serial kernel's summation order (bitwise); the factorization's
-# updates into rows of other chains are atomic (the order in which chains of one level hit a shared ancestor row
-# is arbitrary: float noise, as upstream's CUDA _qLD_acc), updates within a chain keep the serial order.
-_METAL_LDL_CHAINS = os.environ.get("MJW_METAL_LDL_CHAINS", "1") != "0"
+# "chains" (MJW_METAL_LDL_CHAINS=1, default off): one lane per single-child chain of the dof tree per level
+# (height), one world per SIMD group. The solve keeps the serial kernel's summation order (bitwise); the
+# factorization's updates into rows of other chains are atomic (the order in which chains of one level hit a
+# shared ancestor row is arbitrary: float noise, as upstream's CUDA _qLD_acc), updates within a chain keep the
+# serial order. Measured 2026-09-26 at 4096 G1 worlds: factor 0.65 ms / solve 0.37 vs serial 0.45 / 0.21, G1 step
+# 72.9 vs 67.2 ms: the dependent chain shrinks 3.7x but the per-world work is memory-latency bound and the
+# SIMD-group form pays its barriers with most lanes idle (levels 1-3 have 1-2 busy lanes). Kept for A/B.
+_METAL_LDL_CHAINS = os.environ.get("MJW_METAL_LDL_CHAINS", "0") == "1"
 
 
 @cache_kernel

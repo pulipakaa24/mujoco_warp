@@ -3181,101 +3181,108 @@ def _cone_vectors(kmax: int, nv: int):
   return kernel
 
 
-@wp.kernel
-def _cone_update_prepare(
-  # Model:
-  dof_tri_row: wp.array[int],
-  dof_tri_col: wp.array[int],
-  # Data in:
-  efc_J_in: wp.array3d[float],
-  efc_D_in: wp.array2d[float],
-  efc_state_in: wp.array2d[int],
-  # In:
-  quad_changed_ids_in: wp.array2d[int],
-  quad_changed_count_in: wp.array[int],
-  cone_count_big_in: wp.array[int],
-  cone_big_in: wp.array[int],
-  cone_efcid_in: wp.array2d[int],
-  cone_terms_in: wp.array2d[types.vec16],
-  ctx_done_in: wp.array[bool],
-  hfactor_valid_in: wp.array[int],
-  ctx_hfactor_in: wp.array3d[float],
-  # In/out:
-  ctx_h_out: wp.array3d[float],
-  # Out:
-  ctx_htot_out: wp.array3d[float],
-):
-  """One thread per (world, upper-triangle entry), the rank-1 cone path's version of
-  _update_gradient_JTCJ_dense_world2_htot: apply the flipped-row deltas to h; then write to htot what the
-  factor kernel loads: h + the per-entry cone term for worlds above kmax cone rows, h for the others when they
-  refactorize (a quadratic flip or no stored factor), else the stored factor itself (both triangles)."""
-  worldid, elementid = wp.tid()
-  if ctx_done_in[worldid]:
-    return
-  dof1id = dof_tri_row[elementid]
-  dof2id = dof_tri_col[elementid]
-  n_changes = quad_changed_count_in[worldid]
-  h = ctx_h_out[worldid, dof1id, dof2id]
-  if n_changes > 0:
-    delta = float(0.0)
-    for change_idx in range(n_changes):
-      efcid = quad_changed_ids_in[worldid, change_idx]
-      Jrow = efc_J_in[worldid, efcid, dof1id]
-      if Jrow == 0.0:
-        continue
-      Jcol = efc_J_in[worldid, efcid, dof2id]
-      if Jcol == 0.0:
-        continue
-      D = efc_D_in[worldid, efcid]
-      if efc_state_in[worldid, efcid] == types.ConstraintState.QUADRATIC.value:
-        delta += D * Jrow * Jcol
+@cache_kernel
+def _cone_update_prepare(reuse: bool):
+  REUSE = reuse
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    dof_tri_row: wp.array[int],
+    dof_tri_col: wp.array[int],
+    # Data in:
+    efc_J_in: wp.array3d[float],
+    efc_D_in: wp.array2d[float],
+    efc_state_in: wp.array2d[int],
+    # In:
+    quad_changed_ids_in: wp.array2d[int],
+    quad_changed_count_in: wp.array[int],
+    cone_count_big_in: wp.array[int],
+    cone_big_in: wp.array[int],
+    cone_efcid_in: wp.array2d[int],
+    cone_terms_in: wp.array2d[types.vec16],
+    ctx_done_in: wp.array[bool],
+    hfactor_valid_in: wp.array[int],
+    ctx_hfactor_in: wp.array3d[float],
+    # In/out:
+    ctx_h_out: wp.array3d[float],
+    # Out:
+    ctx_htot_out: wp.array3d[float],
+  ):
+    """One thread per (world, upper-triangle entry), the rank-1 cone path's version of
+    _update_gradient_JTCJ_dense_world2_htot: apply the flipped-row deltas to h; then write to htot what the
+    factor kernel loads: h + the per-entry cone term for worlds above kmax cone rows, h for the others when they
+    refactorize (a quadratic flip or no stored factor), else the stored factor itself (both triangles)."""
+    worldid, elementid = wp.tid()
+    if ctx_done_in[worldid]:
+      return
+    dof1id = dof_tri_row[elementid]
+    dof2id = dof_tri_col[elementid]
+    n_changes = quad_changed_count_in[worldid]
+    h = ctx_h_out[worldid, dof1id, dof2id]
+    if n_changes > 0:
+      delta = float(0.0)
+      for change_idx in range(n_changes):
+        efcid = quad_changed_ids_in[worldid, change_idx]
+        Jrow = efc_J_in[worldid, efcid, dof1id]
+        if Jrow == 0.0:
+          continue
+        Jcol = efc_J_in[worldid, efcid, dof2id]
+        if Jcol == 0.0:
+          continue
+        D = efc_D_in[worldid, efcid]
+        if efc_state_in[worldid, efcid] == types.ConstraintState.QUADRATIC.value:
+          delta += D * Jrow * Jcol
+        else:
+          delta -= D * Jrow * Jcol
+      if delta != 0.0:
+        h += delta
+        ctx_h_out[worldid, dof1id, dof2id] = h
+    if cone_big_in[worldid] == 0:
+      if wp.static(REUSE) and n_changes == 0 and hfactor_valid_in[worldid] != 0:
+        # reuse: the factor is upper triangular; the mirrored entry is zero
+        ctx_htot_out[worldid, dof1id, dof2id] = ctx_hfactor_in[worldid, dof1id, dof2id]
+        ctx_htot_out[worldid, dof2id, dof1id] = ctx_hfactor_in[worldid, dof2id, dof1id]
       else:
-        delta -= D * Jrow * Jcol
-    if delta != 0.0:
-      h += delta
-      ctx_h_out[worldid, dof1id, dof2id] = h
-  if cone_big_in[worldid] == 0:
-    if n_changes == 0 and hfactor_valid_in[worldid] != 0:
-      # reuse: the factor is upper triangular; the mirrored entry is zero
-      ctx_htot_out[worldid, dof1id, dof2id] = ctx_hfactor_in[worldid, dof1id, dof2id]
-      ctx_htot_out[worldid, dof2id, dof1id] = ctx_hfactor_in[worldid, dof2id, dof1id]
-    else:
-      ctx_htot_out[worldid, dof1id, dof2id] = h
-    return
-  hsum = float(0.0)
-  for k in range(cone_count_big_in[worldid]):
-    efcid0 = cone_efcid_in[worldid, k]
-    terms = cone_terms_in[worldid, k]
-    nrows = int(terms[0])
-    mu = terms[6]
-    z01 = mu * efc_J_in[worldid, efcid0, dof1id]
-    z02 = mu * efc_J_in[worldid, efcid0, dof2id]
-    projection1 = float(0.0)
-    projection2 = float(0.0)
-    tangent_dot = float(0.0)
-    for dim in range(1, nrows):
-      efcid = efcid0 + dim
-      scale = terms[6 + dim]
-      u = terms[dim]
-      z1 = scale * efc_J_in[worldid, efcid, dof1id]
-      z2 = scale * efc_J_in[worldid, efcid, dof2id]
-      projection1 += u * z1
-      projection2 += u * z2
-      tangent_dot += z1 * z2
-    hsum += _elliptic_hessian_entry_from_projections(
-      terms[12], terms[13], terms[14], terms[15], z01, z02, projection1, projection2, tangent_dot
-    )
-  ctx_htot_out[worldid, dof1id, dof2id] = h + hsum
+        ctx_htot_out[worldid, dof1id, dof2id] = h
+      return
+    hsum = float(0.0)
+    for k in range(cone_count_big_in[worldid]):
+      efcid0 = cone_efcid_in[worldid, k]
+      terms = cone_terms_in[worldid, k]
+      nrows = int(terms[0])
+      mu = terms[6]
+      z01 = mu * efc_J_in[worldid, efcid0, dof1id]
+      z02 = mu * efc_J_in[worldid, efcid0, dof2id]
+      projection1 = float(0.0)
+      projection2 = float(0.0)
+      tangent_dot = float(0.0)
+      for dim in range(1, nrows):
+        efcid = efcid0 + dim
+        scale = terms[6 + dim]
+        u = terms[dim]
+        z1 = scale * efc_J_in[worldid, efcid, dof1id]
+        z2 = scale * efc_J_in[worldid, efcid, dof2id]
+        projection1 += u * z1
+        projection2 += u * z2
+        tangent_dot += z1 * z2
+      hsum += _elliptic_hessian_entry_from_projections(
+        terms[12], terms[13], terms[14], terms[15], z01, z02, projection1, projection2, tangent_dot
+      )
+    ctx_htot_out[worldid, dof1id, dof2id] = h + hsum
+
+  return kernel
 
 
 @cache_kernel
-def _update_gradient_cholesky_cone_update(tile_size: int, kmax: int, skip_noflip: bool):
+def _update_gradient_cholesky_cone_update(tile_size: int, kmax: int, skip_noflip: bool, reuse: bool = True):
   """Factor / update / solve for the rank-1 cone path (MJW_ELLIPTIC_CONE_UPDATE): htot holds (see
   _cone_update_prepare) h + cone term for worlds above kmax cone rows (factorized), h for worlds that
   refactorize (factorized and stored in hfactor), or the stored factor (loaded as is); worlds below kmax then
   apply their cone rows as rank-1 updates (tile_cholesky_update_inplace) and every world solves."""
   SKIP_NOFLIP = skip_noflip
   KMAX = kmax
+  REUSE = reuse
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
@@ -3300,12 +3307,14 @@ def _update_gradient_cholesky_cone_update(tile_size: int, kmax: int, skip_noflip
     TILE_SIZE = wp.static(tile_size)
     if ctx_done_in[worldid]:
       return
+    # the stable-state fast path, exactly as _update_gradient_cholesky(skip_noflip): a world without a state
+    # change keeps its (rescaled) search direction, cone term changes included
+    if wp.static(SKIP_NOFLIP):
+      if state_changed_count_in[worldid] == 0:
+        return
     nvec = cone_nvec_in[worldid]
     big = cone_big_in[worldid] != 0
-    if wp.static(SKIP_NOFLIP):
-      if state_changed_count_in[worldid] == 0 and nvec == 0 and not big:
-        return
-    reuse = (not big) and quad_changed_count_in[worldid] == 0 and hfactor_valid[worldid] != 0
+    reuse = wp.static(REUSE) and (not big) and quad_changed_count_in[worldid] == 0 and hfactor_valid[worldid] != 0
     mat_tile = wp.tile_load(ctx_htot_in[worldid], shape=(TILE_SIZE, TILE_SIZE))
     if not reuse:
       wp.tile_cholesky_inplace(mat_tile, fill_mode="upper")
@@ -3356,7 +3365,7 @@ def _launch_cone_update(m: types.Model, d: types.Data, ctx: SolverContext, skip_
     outputs=[ctx.cone_vecs, ctx.cone_nvec, ctx.cone_count_big, ctx.cone_big],
   )
   wp.launch(
-    _cone_update_prepare,
+    _cone_update_prepare(_CONE_UPDATE_REUSE),
     dim=(d.nworld, m.dof_tri_row.size),
     inputs=[
       m.dof_tri_row,
@@ -3378,7 +3387,7 @@ def _launch_cone_update(m: types.Model, d: types.Data, ctx: SolverContext, skip_
     outputs=[ctx.htot],
   )
   wp.launch_tiled(
-    _update_gradient_cholesky_cone_update(m.nv, _CONE_UPDATE_KMAX, skip_noflip),
+    _update_gradient_cholesky_cone_update(m.nv, _CONE_UPDATE_KMAX, skip_noflip, _CONE_UPDATE_REUSE),
     dim=d.nworld,
     inputs=[
       ctx.grad,
@@ -3555,6 +3564,7 @@ _ELLIPTIC_INCREMENTAL_MODE = int(os.environ.get("MJW_ELLIPTIC_INCREMENTAL", "2")
 # incremental elliptic mode 2 only. MJW_ELLIPTIC_CONE_UPDATE=1 enables (2026-09-26, MetalSim).
 _ELLIPTIC_CONE_UPDATE = os.environ.get("MJW_ELLIPTIC_CONE_UPDATE", "0") == "1"
 _CONE_UPDATE_KMAX = int(os.environ.get("MJW_CONE_UPDATE_KMAX", "6"))
+_CONE_UPDATE_REUSE = os.environ.get("MJW_CONE_UPDATE_REUSE", "1") != "0"   # reuse the stored factor of h across iterations without a quadratic flip
 # cone-term kernels: skip an entry's contact when the contact's Jacobian rows are zero at the entry's first dof
 # (every term of the entry is then zero); measured 1-2 % slower on every model (the test loads cost more than the
 # skipped ones), so the default is 0 = evaluate every contact for every entry; 1 restores the skip (same result)
