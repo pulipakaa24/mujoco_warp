@@ -2178,8 +2178,9 @@ _METAL_FUSE_UPDATE = os.environ.get("MJW_METAL_FUSE_UPDATE", "1") != "0"
 _METAL_FUSE_UPDATE_CPU = os.environ.get("MJW_METAL_FUSE_UPDATE_CPU", "0") == "1"
 _METAL_FUSE_HTOT = os.environ.get("MJW_METAL_FUSE_HTOT", "1") != "0"
 # Lanes per world of the elliptic fused launch (the row / dof / entry loops stride by the block size; the htot fusion's
-# 946-entry loop wants more than one SIMD group per world at full activity). Pyramidal keeps 32.
-_METAL_FUSE_LANES = int(os.environ.get("MJW_METAL_FUSE_LANES", "32"))
+# 946-entry loop wants more than one SIMD group per world at full activity: measured G1 task ellip10 cap 20, 4096
+# worlds, solve per substep 9.55 / 8.72 ms at 32 / 128 lanes on rollout states, env step 106 / 101 ms). Pyramidal keeps 32.
+_METAL_FUSE_LANES = int(os.environ.get("MJW_METAL_FUSE_LANES", "128"))
 
 
 def _fuse_update(m: types.Model, ctx) -> bool:
