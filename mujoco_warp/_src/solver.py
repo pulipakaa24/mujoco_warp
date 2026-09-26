@@ -861,6 +861,7 @@ def _linesearch_iterative_kernel(
   """
   LS_ITERATIONS = ls_iterations
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
+  LS_SKIP_SECONDARY = _LS_SKIP_SECONDARY
   FUSE_JV = fuse_jv
   INCREMENTAL = incremental
   IS_SPARSE = is_sparse
@@ -1066,13 +1067,15 @@ def _linesearch_iterative_kernel(
 
         if efc_type == types.ConstraintType.CONTACT_ELLIPTIC:
           efc_id = efc_id_in[worldid, efcid]
-          contact_friction = contact_friction_in[efc_id]
           efc_addr0 = contact_efc_address_in[efc_id, 0]
-          efc_addr1 = contact_efc_address_in[efc_id, 1]
-          efc_addr2 = contact_efc_address_in[efc_id, 2]
-          ctx_quad = ctx_quad_in[worldid, efcid]
-          quad1 = ctx_quad_in[worldid, efc_addr1]
-          quad2 = ctx_quad_in[worldid, efc_addr2]
+          # only the contact's primary row evaluates the cone (the others return 0): skip their loads
+          if efc_addr0 == efcid or not wp.static(LS_SKIP_SECONDARY):
+            contact_friction = contact_friction_in[efc_id]
+            efc_addr1 = contact_efc_address_in[efc_id, 1]
+            efc_addr2 = contact_efc_address_in[efc_id, 2]
+            ctx_quad = ctx_quad_in[worldid, efcid]
+            quad1 = ctx_quad_in[worldid, efc_addr1]
+            quad2 = ctx_quad_in[worldid, efc_addr2]
 
         local_p0 += _compute_efc_eval_pt_alpha_zero(
           efcid,
@@ -1142,13 +1145,15 @@ def _linesearch_iterative_kernel(
 
         if efc_type == types.ConstraintType.CONTACT_ELLIPTIC:
           efc_id = efc_id_in[worldid, efcid]
-          contact_friction = contact_friction_in[efc_id]
           efc_addr0 = contact_efc_address_in[efc_id, 0]
-          efc_addr1 = contact_efc_address_in[efc_id, 1]
-          efc_addr2 = contact_efc_address_in[efc_id, 2]
-          ctx_quad = ctx_quad_in[worldid, efcid]
-          quad1 = ctx_quad_in[worldid, efc_addr1]
-          quad2 = ctx_quad_in[worldid, efc_addr2]
+          # only the contact's primary row evaluates the cone (the others return 0): skip their loads
+          if efc_addr0 == efcid or not wp.static(LS_SKIP_SECONDARY):
+            contact_friction = contact_friction_in[efc_id]
+            efc_addr1 = contact_efc_address_in[efc_id, 1]
+            efc_addr2 = contact_efc_address_in[efc_id, 2]
+            ctx_quad = ctx_quad_in[worldid, efcid]
+            quad1 = ctx_quad_in[worldid, efc_addr1]
+            quad2 = ctx_quad_in[worldid, efc_addr2]
 
         local_lo_in += _compute_efc_eval_pt(
           efcid,
@@ -1221,13 +1226,15 @@ def _linesearch_iterative_kernel(
 
             if efc_type == types.ConstraintType.CONTACT_ELLIPTIC:
               efc_id = efc_id_in[worldid, efcid]
-              contact_friction = contact_friction_in[efc_id]
               efc_addr0 = contact_efc_address_in[efc_id, 0]
-              efc_addr1 = contact_efc_address_in[efc_id, 1]
-              efc_addr2 = contact_efc_address_in[efc_id, 2]
-              ctx_quad = ctx_quad_in[worldid, efcid]
-              quad1 = ctx_quad_in[worldid, efc_addr1]
-              quad2 = ctx_quad_in[worldid, efc_addr2]
+              # only the contact's primary row evaluates the cone (the others return 0): skip their loads
+              if efc_addr0 == efcid or not wp.static(LS_SKIP_SECONDARY):
+                contact_friction = contact_friction_in[efc_id]
+                efc_addr1 = contact_efc_address_in[efc_id, 1]
+                efc_addr2 = contact_efc_address_in[efc_id, 2]
+                ctx_quad = ctx_quad_in[worldid, efcid]
+                quad1 = ctx_quad_in[worldid, efc_addr1]
+                quad2 = ctx_quad_in[worldid, efc_addr2]
 
             r_lo, r_hi, r_mid = _compute_efc_eval_pt_3alphas(
               efcid,
@@ -2937,6 +2944,9 @@ _JTDAJ_ELLIPTIC_LANES = int(os.environ.get("MJW_JTDAJ_ELLIPTIC_LANES", "32"))
 _ELLIPTIC_INCREMENTAL = os.environ.get("MJW_ELLIPTIC_INCREMENTAL", "1") != "0"
 # allow the fused register-Cholesky path on the CPU device (tests of the elliptic incremental path without a GPU)
 _FUSE_H_CHOLESKY_CPU = os.environ.get("MJW_FUSE_H_CHOLESKY_CPU", "0") == "1"
+# Elliptic line search: secondary rows of a contact contribute 0 and skip their contact / quad loads (1 = default;
+# 0 = the previous form, every row loads them). Same arithmetic.
+_LS_SKIP_SECONDARY = os.environ.get("MJW_LS_SKIP_SECONDARY", "1") != "0"
 _JTDAJ_GROUPS_PER_WORLD = int(os.environ.get("MJW_JTDAJ_GROUPS_PER_WORLD", "0"))
 _JTCJ_SM_FACTOR = int(os.environ.get("MJW_JTCJ_SM_FACTOR", "6"))
 # Off CUDA, Newton Hessians up to this size use the single dense (register) tile Cholesky, larger ones the
