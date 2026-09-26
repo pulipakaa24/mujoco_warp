@@ -2071,6 +2071,156 @@ def _update_gradient_h_incremental_sparse(compact: bool):
   return kernel
 
 
+# Metal: the five per-iteration launches between the line search and the Hessian update (zero the change
+# counters, _update_constraint_efc, qfrc_constraint = J^T force, _update_gradient_zero_grad_dot, _update_gradient_grad)
+# as one launch of 32 lanes per world; every launch is a full drain on Metal (measured ~10 us each in graph replay)
+# and an iteration in which only a few worlds are still solving costs its launches. Dense Jacobian, pyramidal cones,
+# stable-state fast path (the arguments _solver_iteration passes). Row forces / states and the per-dof sums keep the
+# per-kernel arithmetic and order (bitwise); grad_dot is a SIMD-group sum of the per-lane partials instead of atomic
+# adds in arbitrary order (float noise, as the atomics were). MJW_METAL_FUSE_UPDATE=0 disables.
+_METAL_FUSE_UPDATE = os.environ.get("MJW_METAL_FUSE_UPDATE", "1") != "0"
+
+
+def _fuse_update(m: types.Model, ctx) -> bool:
+  return (
+    _METAL_FUSE_UPDATE
+    and getattr(wp.get_device(), "is_metal", False)
+    and not m.is_sparse
+    and not _sparse_compact(ctx)
+    and m.opt.cone != types.ConeType.ELLIPTIC
+  )
+
+
+@cache_kernel
+def _update_constraint_gradient_fused(nv: int):
+  NV = nv
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
+  def kernel(
+    # Data in:
+    ne_in: wp.array[int],
+    nf_in: wp.array[int],
+    nefc_in: wp.array[int],
+    efc_J_in: wp.array3d[float],
+    efc_D_in: wp.array2d[float],
+    efc_frictionloss_in: wp.array2d[float],
+    efc_Ma_in: wp.array2d[float],
+    qfrc_smooth_in: wp.array2d[float],
+    njmax_in: int,
+    # In:
+    ctx_Jaref_in: wp.array2d[float],
+    ctx_ls_exhausted_in: wp.array[bool],
+    ctx_alpha_in: wp.array[float],
+    ctx_done_in: wp.array[bool],
+    # Data out:
+    efc_force_out: wp.array2d[float],
+    efc_state_out: wp.array2d[int],
+    qfrc_constraint_out: wp.array2d[float],
+    # Out:
+    quad_changed_ids_out: wp.array2d[int],
+    quad_changed_count_out: wp.array[int],
+    state_changed_count_out: wp.array[int],
+    ctx_grad_out: wp.array2d[float],
+    ctx_grad_dot_out: wp.array[float],
+    ctx_newton_decrement_out: wp.array[float],
+    ctx_grad_scale_out: wp.array[float],
+    ctx_search_unchanged_out: wp.array[bool],
+  ):
+    worldid, lane = wp.tid()
+    done = ctx_done_in[worldid]
+    # _zero_change_counters (every world) and the done branch of _update_gradient_zero_grad_dot
+    if lane == 0:
+      quad_changed_count_out[worldid] = 0
+      state_changed_count_out[worldid] = 0
+      if done:
+        ctx_search_unchanged_out[worldid] = True
+    if done:
+      return
+    _syncthreads()
+
+    # _update_constraint_efc (pyramidal rows), one lane per row
+    if lane == 0:
+      if ctx_ls_exhausted_in[worldid]:
+        wp.atomic_add(state_changed_count_out, worldid, 1)
+    nefc = wp.min(njmax_in, nefc_in[worldid])
+    ne = ne_in[worldid]
+    nf = nf_in[worldid]
+    for efcid in range(lane, nefc, wp.block_dim()):
+      old_state = efc_state_out[worldid, efcid]
+      is_equality = efcid < ne
+      is_friction = (not is_equality) and (efcid < ne + nf)
+      frictionloss = float(0.0)
+      if is_friction:
+        frictionloss = efc_frictionloss_in[worldid, efcid]
+      res = _eval_constraint(
+        is_equality,
+        is_friction,
+        False,
+        ctx_Jaref_in[worldid, efcid],
+        efc_D_in[worldid, efcid],
+        frictionloss,
+        efcid,
+        -1,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+      )
+      new_state = int(res[1])
+      efc_force_out[worldid, efcid] = res[0]
+      efc_state_out[worldid, efcid] = new_state
+      old_quad = old_state == types.ConstraintState.QUADRATIC.value
+      new_quad = new_state == types.ConstraintState.QUADRATIC.value
+      if old_quad != new_quad:
+        idx = wp.atomic_add(quad_changed_count_out, worldid, 1)
+        quad_changed_ids_out[worldid, idx] = efcid
+      if old_state != new_state:
+        wp.atomic_add(state_changed_count_out, worldid, 1)
+    _syncthreads()
+
+    # _update_gradient_zero_grad_dot (stable_fast)
+    changed = state_changed_count_out[worldid]
+    if lane == 0:
+      ctx_search_unchanged_out[worldid] = changed == 0
+      if changed == 0:
+        sigma = ctx_grad_scale_out[worldid]
+        new_sigma = sigma - ctx_alpha_in[worldid]
+        ratio = float(0.0)
+        if sigma != 0.0:
+          ratio = new_sigma / sigma
+        ratio_sq = ratio * ratio
+        ctx_grad_dot_out[worldid] = ctx_grad_dot_out[worldid] * ratio_sq
+        ctx_newton_decrement_out[worldid] = ctx_newton_decrement_out[worldid] * ratio_sq
+        ctx_grad_scale_out[worldid] = new_sigma
+      else:
+        ctx_newton_decrement_out[worldid] = 0.0
+        ctx_grad_scale_out[worldid] = 1.0
+    if changed == 0:
+      return
+
+    # qfrc_constraint = J^T force (rows in order, as _update_constraint_init_qfrc_constraint_dense) and
+    # grad = Ma - qfrc_smooth - qfrc_constraint (_update_gradient_grad), one lane per dof
+    local = float(0.0)
+    for dofid in range(lane, wp.static(NV), wp.block_dim()):
+      sum_qfrc = float(0.0)
+      for efcid in range(nefc):
+        sum_qfrc += efc_J_in[worldid, efcid, dofid] * efc_force_out[worldid, efcid]
+      qfrc_constraint_out[worldid, dofid] = sum_qfrc
+      grad = efc_Ma_in[worldid, dofid] - qfrc_smooth_in[worldid, dofid] - sum_qfrc
+      ctx_grad_out[worldid, dofid] = grad
+      local += grad * grad
+    total = wp.tile_reduce(wp.add, wp.tile(local, preserve_type=True))
+    if lane == 0:
+      ctx_grad_dot_out[worldid] = total[0]
+
+  return kernel
+
+
 def _update_constraint(
   m: types.Model,
   d: types.Data,
@@ -3669,26 +3819,27 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
     raise ValueError(f"Unknown solver type: {m.opt.solver}")
 
 
-def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverContext, stable_fast: bool = False):
+def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverContext, stable_fast: bool = False, grad_done: bool = False):
   """Incremental gradient update: update H for changed constraints + re-factorize.
 
   Skips the full J^T*D*J rebuild by applying only the delta from constraints
   that changed QUADRATIC state, then re-factorizes and solves.
   """
   changed = ctx.state_changed_count if stable_fast else d.nefc
-  wp.launch(
-    _update_gradient_zero_grad_dot(stable_fast),
-    dim=d.nworld,
-    inputs=[changed, ctx.alpha, ctx.done],
-    outputs=[ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
-  )
+  if not grad_done:   # grad_done: _update_constraint_gradient_fused already wrote grad / grad_dot / grad_scale
+    wp.launch(
+      _update_gradient_zero_grad_dot(stable_fast),
+      dim=d.nworld,
+      inputs=[changed, ctx.alpha, ctx.done],
+      outputs=[ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
+    )
 
-  wp.launch(
-    _update_gradient_grad(stable_fast),
-    dim=(d.nworld, m.nv),
-    inputs=[d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, changed, ctx.done],
-    outputs=[ctx.grad, ctx.grad_dot],
-  )
+    wp.launch(
+      _update_gradient_grad(stable_fast),
+      dim=(d.nworld, m.nv),
+      inputs=[d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, changed, ctx.done],
+      outputs=[ctx.grad, ctx.grad_dot],
+    )
 
   # Update upper triangle of H with delta from changed constraints.
   sc = _sparse_compact(ctx)
@@ -3957,6 +4108,20 @@ def _solver_iteration(
   # changes every iteration.
   incremental = _use_incremental(m)
 
+  if incremental and _fuse_update(m, ctx):
+    wp.launch_tiled(
+      _update_constraint_gradient_fused(m.nv),
+      dim=d.nworld,
+      inputs=[d.ne, d.nf, d.nefc, d.efc.J, d.efc.D, d.efc.frictionloss, d.efc.Ma, d.qfrc_smooth, d.njmax,
+              ctx.Jaref, ctx.ls_exhausted, ctx.alpha, ctx.done],
+      outputs=[d.efc.force, d.efc.state, d.qfrc_constraint, ctx.quad_changed_ids, ctx.quad_changed_count,
+               ctx.state_changed_count, ctx.grad, ctx.grad_dot, ctx.newton_decrement, ctx.grad_scale, ctx.search_unchanged],
+      block_dim=32,
+    )
+    _update_gradient_incremental(m, d, ctx, stable_fast=True, grad_done=True)
+    _solver_iteration_finish(m, d, ctx, nsolving)
+    return
+
   if incremental:
     # Must complete before _update_constraint_efc which atomically increments.
     wp.launch(
@@ -3976,6 +4141,10 @@ def _solver_iteration(
   else:
     _update_gradient(m, d, ctx, compact=compact)
 
+  _solver_iteration_finish(m, d, ctx, nsolving)
+
+
+def _solver_iteration_finish(m: types.Model, d: types.Data, ctx: SolverContext, nsolving: wp.array[int]):
   # polak-ribiere
   if m.opt.solver == types.SolverType.CG:
     wp.launch_tiled(
