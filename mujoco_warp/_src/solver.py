@@ -35,6 +35,11 @@ from mujoco_warp._src.types import SolverContext
 from mujoco_warp._src.warp_util import cache_kernel
 from mujoco_warp._src.warp_util import event_scope
 
+try:  # the Warp fork's Metal indirect execution ranges (graph-replay early exit); absent in other Warp builds
+  from warp._src import context as _wp_context
+except ImportError:  # pragma: no cover
+  _wp_context = None
+
 wp.set_module_options({"enable_backward": False, "default_grid_stride": False})
 
 _BLOCK_CHOLESKY_DIM = 32
@@ -125,6 +130,7 @@ def _create_solver_context(m: types.Model, d: types.Data) -> SolverContext:
     cone_count_big=wp.zeros((nworld,), dtype=int) if alloc_cone_upd else wp.empty((0,), dtype=int),
     cone_big=wp.zeros((nworld,), dtype=int) if alloc_cone_upd else wp.empty((0,), dtype=int),
     hfactor_valid=wp.zeros((nworld,), dtype=int) if alloc_cone_upd else wp.empty((0,), dtype=int),
+    ls_iters=wp.zeros((nworld,), dtype=int) if _LS_STATS else None,
   )
 
 
@@ -856,6 +862,8 @@ def _linesearch_iterative_kernel(
   is_sparse: bool,
   incremental: bool,
   warn_overflow: int,
+  noise_floor_eps: float = 0.0,
+  ls_stats: bool = False,
 ):
   """Factory for iterative linesearch kernel.
 
@@ -872,6 +880,13 @@ def _linesearch_iterative_kernel(
   FUSE_JV = fuse_jv
   INCREMENTAL = incremental
   IS_SPARSE = is_sparse
+  # derivative noise floor: the convergence test |P'(alpha)| < gtol cannot be met when gtol is below the rounding
+  # noise of the derivative sum, ~eps x its gross magnitude (sum |q1_i| + |alpha| sum 2 q2_i, bounded as for the
+  # alpha floor below); the search then bisects to its budget (measured: 10 % of calls, 18 % at Newton iteration 1)
+  # and every launch runs as long as its slowest world. With NOISE_FLOOR_EPS > 0 the test uses
+  # max(gtol, NOISE_FLOOR_EPS x eps x gross magnitude) (Genesis PR #3382's rule; MJW_LS_NOISE_FLOOR).
+  NOISE_FLOOR_EPS = noise_floor_eps * 1.1920929e-07
+  LS_STATS = ls_stats
 
   # Native snippet for CUDA __syncthreads()
   @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -934,6 +949,7 @@ def _linesearch_iterative_kernel(
     ctx_improvement_out: wp.array[float],
     ctx_alpha_out: wp.array[float],
     ctx_ls_exhausted_out: wp.array[bool],
+    ctx_ls_iters_out: wp.array[int],
   ):
     worldid, tid = wp.tid()
 
@@ -1134,6 +1150,15 @@ def _linesearch_iterative_kernel(
       q1_abs = wp.sqrt(2.0 * wp.max(rows[0], 0.0) * wp.max(rows[2], 0.0)) + wp.abs(ctx_quad_gauss[1])
       noise_floor = _ALPHA_NOISE_EPS * wp.max(1.0, math.safe_div(q1_abs, p0[2]))
 
+    # derivative noise floor (see NOISE_FLOOR_EPS): gtol_at(alpha) = max(gtol, dnoise0 + |alpha| dnoise1)
+    dnoise0 = float(0.0)
+    dnoise1 = float(0.0)
+    if wp.static(NOISE_FLOOR_EPS > 0.0):
+      rows_f = p0_sum[0]
+      q1_abs_f = wp.sqrt(2.0 * wp.max(rows_f[0], 0.0) * wp.max(rows_f[2], 0.0)) + wp.abs(ctx_quad_gauss[1])
+      dnoise0 = wp.static(NOISE_FLOOR_EPS) * q1_abs_f
+      dnoise1 = wp.static(NOISE_FLOOR_EPS) * wp.max(p0[2], 0.0)
+
     # lo_in at lo_alpha_in = -p0[1] / p0[2]
     lo_alpha_in = -math.safe_div(p0[1], p0[2])
 
@@ -1193,8 +1218,10 @@ def _linesearch_iterative_kernel(
     lo_in = _eval_pt(ctx_quad_gauss, lo_alpha_in) + lo_in_sum[0]
 
     # accept Newton step if derivative is small and cost improved
-    initial_converged = wp.abs(lo_in[1]) < gtol and lo_in[0] < 0.0
+    gtol_in = wp.max(gtol, dnoise0 + wp.abs(lo_alpha_in) * dnoise1)
+    initial_converged = wp.abs(lo_in[1]) < gtol_in and lo_in[0] < 0.0
     ls_converged = initial_converged
+    ls_count = int(0)
 
     # main iterative loop - skip if already converged
     if not initial_converged:
@@ -1325,10 +1352,13 @@ def _linesearch_iterative_kernel(
         swap_hi = swap_hi_hi_next or swap_hi_mid or swap_hi_lo_next
 
         # check for convergence
+        ls_count += 1
+        gtol_lo = wp.max(gtol, dnoise0 + wp.abs(lo_alpha) * dnoise1)
+        gtol_hi = wp.max(gtol, dnoise0 + wp.abs(hi_alpha) * dnoise1)
         ls_done = (
           (not swap_lo and not swap_hi)
-          or (lo[0] < 0.0 and lo[1] < 0.0 and lo[1] > -gtol)
-          or (hi[0] < 0.0 and hi[1] > 0.0 and hi[1] < gtol)
+          or (lo[0] < 0.0 and lo[1] < 0.0 and lo[1] > -gtol_lo)
+          or (hi[0] < 0.0 and hi[1] > 0.0 and hi[1] < gtol_hi)
         )
 
         # update alpha if improved
@@ -1358,6 +1388,8 @@ def _linesearch_iterative_kernel(
     if tid == 0:
       ctx_improvement_out[worldid] = improvement
       ctx_alpha_out[worldid] = alpha
+      if wp.static(LS_STATS):
+        ctx_ls_iters_out[worldid] = ls_count
       if wp.static(INCREMENTAL):
         ctx_ls_exhausted_out[worldid] = wp.abs(alpha) < noise_floor
       if not ls_converged:
@@ -1381,6 +1413,7 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
     ctx: SolverContext.
     fuse_jv: Whether jv is computed in-kernel (True) or pre-computed (False).
   """
+  ls_iters = getattr(ctx, "ls_iters", None)
   wp.launch_tiled(
     _linesearch_iterative_kernel(
       m.opt.ls_iterations,
@@ -1389,6 +1422,8 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
       m.is_sparse,
       _use_incremental(m),
       int(m.opt.warn_overflow),
+      _LS_NOISE_FLOOR_EPS,
+      ls_iters is not None,
     ),
     dim=d.nworld,
     inputs=[
@@ -1433,6 +1468,7 @@ def _linesearch_iterative(m: types.Model, d: types.Data, ctx: SolverContext, fus
       ctx.improvement,
       ctx.alpha,
       ctx.ls_exhausted,
+      ls_iters if ls_iters is not None else wp.empty(0, dtype=int),
     ],
     block_dim=m.block_dim.linesearch_iterative,
   )
@@ -4954,6 +4990,12 @@ def _solve_done(warn_overflow: int, early_exit: bool = False):
 # stale ray; rebuilding re-anchors the arithmetic at the current (much smaller)
 # gradient scale. The 8 is an allowance for the reduction depth of the sums.
 _ALPHA_NOISE_EPS = 8.0 * 1.1920929e-07  # 8 * float32 eps
+# Line-search derivative noise floor in units of float32 eps (0 = off, upstream's test): see
+# _linesearch_iterative_kernel. MJW_LS_NOISE_FLOOR (default 0 until measured on Metal; the CPU harness is
+# scripts/diagnostics/ls_noise_floor_check.py in MetalSim).
+_LS_NOISE_FLOOR_EPS = float(os.environ.get("MJW_LS_NOISE_FLOOR", "0"))
+# MJW_LS_STATS=1: ctx.ls_iters records each world's line-search iteration count (diagnostics only)
+_LS_STATS = os.environ.get("MJW_LS_STATS", "0") == "1"
 
 
 def _use_incremental(m: types.Model) -> bool:
@@ -5163,9 +5205,9 @@ def _icb_early_exit_ranges(m: types.Model) -> wp.array | None:
   if not _METAL_ICB_EARLY_EXIT or m.opt.iterations <= 1 or m.opt.graph_conditional:
     return None
   dev = wp.get_device()
-  if not getattr(dev, "is_metal", False) or not hasattr(wp.context, "metal_capture_range_begin"):
+  if not getattr(dev, "is_metal", False) or _wp_context is None or not hasattr(_wp_context, "metal_capture_range_begin"):
     return None
-  if getattr(wp.context.runtime, "_metal_graph", None) is None:   # eager launches: nothing to gate
+  if getattr(_wp_context.runtime, "_metal_graph", None) is None:   # eager launches: nothing to gate
     return None
   # no memset: the backend writes the fields at the range's end (capture time); a recorded memset would clear them
   return wp.empty(4 * m.opt.iterations, dtype=wp.uint32)
@@ -5216,10 +5258,10 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # It should be removed when JAX becomes compatible.
     ranges = ctx.icb_ranges
     for i in range(m.opt.iterations):
-      gated = ranges is not None and wp.context.metal_capture_range_begin(ranges, i)
+      gated = ranges is not None and _wp_context.metal_capture_range_begin(ranges, i)
       _solver_iteration(m, d, ctx, nsolving, compact=compact, iteration=i)
       if gated:
-        wp.context.metal_capture_range_end()
+        _wp_context.metal_capture_range_end()
 
   # Recover qfrc_constraint (the compacted buffer when run under solve_compact):
   # the fast path leaves it stale, and the per-iteration zeroing wiped it for

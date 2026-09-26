@@ -2565,6 +2565,7 @@ class SolverContext:
   hfactor_valid: wp.array[int] = None      # 1 when hfactor holds the factor of h (M + J'DJ over QUADRATIC rows)
   # Metal graph replay early exit (solver._icb_early_exit_ranges): per-iteration ICB execution ranges, None otherwise
   icb_ranges: wp.array[wp.uint32] = None
+  ls_iters: wp.array[int] = None           # MJW_LS_STATS=1: line-search iterations per world (diagnostics)
 
 
 @dataclasses.dataclass
