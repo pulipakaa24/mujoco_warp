@@ -16,6 +16,8 @@
 from typing import Tuple
 
 import warp as wp
+import os as _os
+SPECULATIVE_GAP = _os.environ.get("MJW_SPECULATIVE_GAP", "0") == "1"
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -182,10 +184,20 @@ def _efc_row(
   b = kbimp[1]
   imp = kbimp[2]
 
+  aref = -k * imp * pos_aref - b * vel
+  if wp.static(SPECULATIVE_GAP):
+    # MetalSim prototype: a contact row at positive distance (inside the gap) is speculative; its reference is PhysX's
+    # speculative-contact bias, v_n(t+h) >= -pos/h (DyTGSContactPrep: bias = -separation / dt for separated contacts),
+    # i.e. a_ref = -(v + pos/h)/h, at the hardest impedance: it pushes only if the approach would close the gap within
+    # this step, and only enough to stop at the surface
+    if type >= int(ConstraintType.CONTACT_FRICTIONLESS) and pos_aref > 0.0:
+      imp = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+      aref = -(vel + pos_aref / timestep) / timestep
+
   # set outputs
   D_out[worldid, efcid] = _efc_D(invweight, imp)
   vel_out[worldid, efcid] = vel
-  aref_out[worldid, efcid] = -k * imp * pos_aref - b * vel
+  aref_out[worldid, efcid] = aref
   pos_out[worldid, efcid] = pos_aref + margin
   margin_out[worldid, efcid] = margin
   frictionloss_out[worldid, efcid] = frictionloss
@@ -2788,6 +2800,11 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
       active = (pos < 0.0) or (adhesion_in[conid] != 0.0)
     else:
       active = pos < 0.0
+    if wp.static(SPECULATIVE_GAP):
+      # MetalSim prototype (MJW_SPECULATIVE_GAP=1): every detected contact (dist < margin + gap) gets constraint rows, so
+      # contacts inside the gap are speculative rows with pos = dist - margin > 0; the unilateral soft constraint acts on
+      # them only when the approach velocity makes a_ref positive (-b v > k imp pos), like PhysX's contact offset
+      active = True
 
     if not active:
       return
@@ -2924,6 +2941,11 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
       active = (pos < 0.0) or (adhesion_in[conid] != 0.0)
     else:
       active = pos < 0.0
+    if wp.static(SPECULATIVE_GAP):
+      # MetalSim prototype (MJW_SPECULATIVE_GAP=1): every detected contact (dist < margin + gap) gets constraint rows, so
+      # contacts inside the gap are speculative rows with pos = dist - margin > 0; the unilateral soft constraint acts on
+      # them only when the approach velocity makes a_ref positive (-b v > k imp pos), like PhysX's contact offset
+      active = True
 
     if not active:
       return

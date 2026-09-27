@@ -18,6 +18,8 @@ from typing import Tuple
 import os
 
 import warp as wp
+import os as _os
+SPECULATIVE_GAP = _os.environ.get("MJW_SPECULATIVE_GAP", "0") == "1"
 
 from mujoco_warp._src.collision_core import CollisionContext
 from mujoco_warp._src.collision_core import Geom
@@ -1024,7 +1026,12 @@ def plane_convex_wrapper(
   nacon_out: wp.array[int],
 ):
   """Calculates contacts between a plane and a convex object."""
-  dist, pos, normal = plane_convex(plane.normal, plane.pos, convex, margin)
+  if wp.static(SPECULATIVE_GAP):
+    # MetalSim prototype: detect out to margin + gap (write_contact classifies), so gap-zone contacts exist for the
+    # speculative rows of constraint.py
+    dist, pos, normal = plane_convex(plane.normal, plane.pos, convex, margin + gap)
+  else:
+    dist, pos, normal = plane_convex(plane.normal, plane.pos, convex, margin)
 
   frame = make_frame(normal)
   for i in range(4):
