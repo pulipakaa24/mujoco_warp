@@ -32,6 +32,9 @@ SPECULATIVE_IMP_DMAX = _os.environ.get("MJW_SPECULATIVE_IMP", "d0") == "dmax"
 SPECULATIVE_FRICTION = _os.environ.get("MJW_SPEC_FRICTION", "cone")
 # control for the constraint-count hypothesis: rows are allocated for speculative contacts but made inert (J = 0, aref = 0)
 SPECULATIVE_NULL = _os.environ.get("MJW_SPEC_NULL", "0") == "1"
+# impedance of the elliptic friction rows of a speculative contact: "d0" (= its normal row's, MuJoCo's cone construction) or
+# "pos" (prototype bc83fb0: imp(|pos|), i.e. dmax beyond width while the normal row has d0)
+SPECULATIVE_FRICIMP_D0 = _os.environ.get("MJW_SPEC_FRICIMP", "pos") == "d0"
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -210,6 +213,13 @@ def _efc_row(
       else:
         imp = wp.clamp(solimp[0], types.MJ_MINIMP, types.MJ_MAXIMP)
       aref = -(vel + pos_aref / timestep) / timestep
+    elif wp.static(SPECULATIVE_FRICIMP_D0 and not SPECULATIVE_IMP_DMAX):
+      # elliptic friction rows of a speculative contact (pos_aref = 0, pos_imp = pos > 0): the same impedance as their normal
+      # row, as MuJoCo builds every elliptic cone (R_friction = R_normal / impratio * (mu_0 / mu_j)^2); without this the
+      # friction rows keep imp(|pos|) (-> dmax beyond `width`) while the normal row has d0, a 1000x stiffer tangential
+      # regularisation that the Newton line search resolves differently from MuJoCo C's (C-oracle divergence, 2026-09-27)
+      if type == int(ConstraintType.CONTACT_ELLIPTIC) and pos_imp > 0.0:
+        imp = wp.clamp(solimp[0], types.MJ_MINIMP, types.MJ_MAXIMP)
 
   # set outputs
   D_out[worldid, efcid] = _efc_D(invweight, imp)
