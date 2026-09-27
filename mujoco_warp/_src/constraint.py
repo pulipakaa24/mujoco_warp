@@ -18,6 +18,9 @@ from typing import Tuple
 import warp as wp
 import os as _os
 SPECULATIVE_GAP = _os.environ.get("MJW_SPECULATIVE_GAP", "0") == "1"
+# impedance of speculative rows: "d0" (solimp[0], default: conditioned like a contact at touch-down) or "dmax" (hardest;
+# with several coupled speculative rows the Newton line search then stalls and efc.force stops matching qacc)
+SPECULATIVE_IMP_DMAX = _os.environ.get("MJW_SPECULATIVE_IMP", "d0") == "dmax"
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -188,10 +191,13 @@ def _efc_row(
   if wp.static(SPECULATIVE_GAP):
     # MetalSim prototype: a contact row at positive distance (inside the gap) is speculative; its reference is PhysX's
     # speculative-contact bias, v_n(t+h) >= -pos/h (DyTGSContactPrep: bias = -separation / dt for separated contacts),
-    # i.e. a_ref = -(v + pos/h)/h, at the hardest impedance: it pushes only if the approach would close the gap within
+    # i.e. a_ref = -(v + pos/h)/h, at impedance d0 (or dmax, MJW_SPECULATIVE_IMP=dmax): it pushes only if the approach would close the gap within
     # this step, and only enough to stop at the surface
     if type >= int(ConstraintType.CONTACT_FRICTIONLESS) and pos_aref > 0.0:
-      imp = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+      if wp.static(SPECULATIVE_IMP_DMAX):
+        imp = wp.clamp(solimp[1], types.MJ_MINIMP, types.MJ_MAXIMP)
+      else:
+        imp = wp.clamp(solimp[0], types.MJ_MINIMP, types.MJ_MAXIMP)
       aref = -(vel + pos_aref / timestep) / timestep
 
   # set outputs
