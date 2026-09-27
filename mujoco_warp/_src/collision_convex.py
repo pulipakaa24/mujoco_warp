@@ -1287,6 +1287,29 @@ def _ccd_grid_size(kernel, naconmax: int, device) -> int:
   return max(1, min(naconmax, _CCD_OVERSUBSCRIBE_WAVES * block_size * min_grid_size))
 
 
+# Metal: the EPA / multi-contact scratch below is allocated once per Data and reused by every narrowphase call. Each
+# call used to allocate it afresh; inside a graph capture the Metal backend keeps every such allocation alive for the
+# graph's lifetime (as CUDA graph allocations), so a step graph of k substeps held k copies (about 2.8 GB per substep at
+# 4096 worlds with naccdmax = naconmax 128 per world) and the G1 rough task at 8 substeps exhausted the GPU working set.
+# The arrays are pure per-call scratch (written before read, indexed by the call's own ccd slot) and Metal runs every
+# launch of a device on one in-order queue, so sharing them across calls and graphs changes no result.
+# MJW_METAL_CCD_SCRATCH_CACHE=0 restores the per-call allocation.
+_METAL_CCD_SCRATCH_CACHE = os.environ.get("MJW_METAL_CCD_SCRATCH_CACHE", "1") != "0"
+
+
+def _ccd_scratch(d: Data, name: str, shape: Tuple[int, int], dtype) -> wp.array:
+  """wp.empty(shape, dtype); on Metal a per-Data cached array reused by every call (see _METAL_CCD_SCRATCH_CACHE)."""
+  device = wp.get_device()
+  if not (_METAL_CCD_SCRATCH_CACHE and getattr(device, "is_metal", False)):
+    return wp.empty(shape=shape, dtype=dtype)
+  cache = d.__dict__.setdefault("_metal_ccd_scratch", {})
+  key = (name, str(device), tuple(shape), dtype)
+  arr = cache.get(key)
+  if arr is None:
+    arr = cache[key] = wp.empty(shape=shape, dtype=dtype)
+  return arr
+
+
 @event_scope
 def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table: list[tuple[GeomType, GeomType]]):
   """Runs narrowphase collision detection for convex geom pairs.
@@ -1347,17 +1370,17 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
   nccd = wp.zeros(len(GeomType) * (len(GeomType) + 1) // 2, dtype=int)
 
   # epa_vert: vertices in EPA polytope
-  epa_vert = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=wp.vec3)
+  epa_vert = _ccd_scratch(d, "epa_vert", (d.naccdmax, 10 + 2 * epa_iterations), wp.vec3)
   # epa_vert_index: vertex indices in EPA polytope
-  epa_vert_index = wp.empty(shape=(d.naccdmax, 10 + 2 * epa_iterations), dtype=int)
+  epa_vert_index = _ccd_scratch(d, "epa_vert_index", (d.naccdmax, 10 + 2 * epa_iterations), int)
   # epa_face: faces of polytope represented by three indices
-  epa_face = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int)
+  epa_face = _ccd_scratch(d, "epa_face", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), int)
   # epa_pr: projection of origin on polytope faces
-  epa_pr = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3)
+  epa_pr = _ccd_scratch(d, "epa_pr", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), wp.vec3)
   # epa_norm2: epa_pr * epa_pr
-  epa_norm2 = wp.empty(shape=(d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float)
+  epa_norm2 = _ccd_scratch(d, "epa_norm2", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), float)
   # epa_horizon: index pair (i j) of edges on horizon
-  epa_horizon = wp.empty(shape=(d.naccdmax, MJ_MAX_EPAHORIZON), dtype=int)
+  epa_horizon = _ccd_scratch(d, "epa_horizon", (d.naccdmax, MJ_MAX_EPAHORIZON), int)
 
   # Contact outputs
   contact_outputs = [
@@ -1451,27 +1474,27 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
 
   # Allocate multiccd arrays only for non-heightfield collisions
   # multiccd_polygon: clipped contact surface
-  multiccd_polygon = wp.empty(shape=(d.naccdmax, 2 * npolygonmax), dtype=wp.vec3)
+  multiccd_polygon = _ccd_scratch(d, "multiccd_polygon", (d.naccdmax, 2 * npolygonmax), wp.vec3)
   # multiccd_clipped: clipped contact surface (intermediate)
-  multiccd_clipped = wp.empty(shape=(d.naccdmax, 2 * npolygonmax), dtype=wp.vec3)
+  multiccd_clipped = _ccd_scratch(d, "multiccd_clipped", (d.naccdmax, 2 * npolygonmax), wp.vec3)
   # multiccd_pnormal: plane normal of clipping polygon
-  multiccd_pnormal = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=wp.vec3)
+  multiccd_pnormal = _ccd_scratch(d, "multiccd_pnormal", (d.naccdmax, npolygonmax), wp.vec3)
   # multiccd_pdist: plane distance of clipping polygon
-  multiccd_pdist = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=float)
+  multiccd_pdist = _ccd_scratch(d, "multiccd_pdist", (d.naccdmax, npolygonmax), float)
   # multiccd_idx1: list of normal index candidates for Geom 1
-  multiccd_idx1 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=int)
+  multiccd_idx1 = _ccd_scratch(d, "multiccd_idx1", (d.naccdmax, nmeshdegmax), int)
   # multiccd_idx2: list of normal index candidates for Geom 2
-  multiccd_idx2 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=int)
+  multiccd_idx2 = _ccd_scratch(d, "multiccd_idx2", (d.naccdmax, nmeshdegmax), int)
   # multiccd_n1: list of normal candidates for Geom 1
-  multiccd_n1 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=wp.vec3)
+  multiccd_n1 = _ccd_scratch(d, "multiccd_n1", (d.naccdmax, nmeshdegmax), wp.vec3)
   # multiccd_n2: list of normal candidates for Geom 1
-  multiccd_n2 = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=wp.vec3)
+  multiccd_n2 = _ccd_scratch(d, "multiccd_n2", (d.naccdmax, nmeshdegmax), wp.vec3)
   # multiccd_endvert: list of edge vertices candidates
-  multiccd_endvert = wp.empty(shape=(d.naccdmax, nmeshdegmax), dtype=wp.vec3)
+  multiccd_endvert = _ccd_scratch(d, "multiccd_endvert", (d.naccdmax, nmeshdegmax), wp.vec3)
   # multiccd_face1: contact face
-  multiccd_face1 = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=wp.vec3)
+  multiccd_face1 = _ccd_scratch(d, "multiccd_face1", (d.naccdmax, npolygonmax), wp.vec3)
   # multiccd_face2: contact face
-  multiccd_face2 = wp.empty(shape=(d.naccdmax, npolygonmax), dtype=wp.vec3)
+  multiccd_face2 = _ccd_scratch(d, "multiccd_face2", (d.naccdmax, npolygonmax), wp.vec3)
 
   # Launch non-heightfield collision kernels (no hfield args, 78 args total)
   for geom_pair in collision_table:
