@@ -21,6 +21,17 @@ SPECULATIVE_GAP = _os.environ.get("MJW_SPECULATIVE_GAP", "0") == "1"
 # impedance of speculative rows: "d0" (solimp[0], default: conditioned like a contact at touch-down) or "dmax" (hardest;
 # with several coupled speculative rows the Newton line search then stalls and efc.force stops matching qacc)
 SPECULATIVE_IMP_DMAX = _os.environ.get("MJW_SPECULATIVE_IMP", "d0") == "dmax"
+# friction on speculative contacts (elliptic cones; experiments of 2026-09-27):
+#   "cone" (prototype bc83fb0): full elliptic rows; the soft cone's middle zone then produces normal and friction force from
+#          tangential slip alone, i.e. a skimming swing foot inside the gap is braked and lifted although its normal row
+#          would not push;
+#   "none": speculative contacts carry no friction (friction rows inert);
+#   "live": friction rows only when the normal row predicts a crossing within the step (pos + h * v_n < 0), otherwise inert:
+#          PhysX's rule, whose friction is bounded by the contact's accumulated normal impulse (DyTGSContactPrep.cpp:1643-1654,
+#          solverBlockTGS.cuh:337-338), so friction is zero whenever the speculative normal impulse is zero.
+SPECULATIVE_FRICTION = _os.environ.get("MJW_SPEC_FRICTION", "cone")
+# control for the constraint-count hypothesis: rows are allocated for speculative contacts but made inert (J = 0, aref = 0)
+SPECULATIVE_NULL = _os.environ.get("MJW_SPEC_NULL", "0") == "1"
 
 from mujoco_warp._src import math
 from mujoco_warp._src import support
@@ -4469,6 +4480,79 @@ def _efc_contact_update(cone_type: types.ConeType, flg_adhesion: bool):
 
 
 @cache_kernel
+def _efc_contact_spec_gate(is_sparse: bool, friction_mode: int, null_rows: bool):
+  """MetalSim prototype: make rows of speculative contacts inert (J = 0, vel = 0, aref = 0), elliptic cones only.
+
+  An inert row has jaref = 0 in every solver iteration, so its contact sits in the top zone of the elliptic cone (T = 0,
+  N >= 0: no force) or, for friction rows of a contact whose normal row pushes, adds nothing (T = 0 -> bottom zone of the
+  normal alone, friction rows have force -D * 0). friction_mode: 0 cone (friction rows kept), 1 none, 2 live.
+  """
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    opt_timestep: wp.array[float],
+    # Data in:
+    nacon_in: wp.array[int],
+    contact_efc_address_in: wp.array2d[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    # In:
+    dist_in: wp.array[float],
+    condim_in: wp.array[int],
+    includemargin_in: wp.array[float],
+    worldid_in: wp.array[int],
+    type_in: wp.array[int],
+    nv_padded: int,
+    # Data out:
+    efc_J_out: wp.array3d[float],
+    efc_Jqvel_out: wp.array2d[float],
+    efc_vel_out: wp.array2d[float],
+    efc_aref_out: wp.array2d[float],
+  ):
+    conid, dimid = wp.tid()
+    if conid >= nacon_in[0]:
+      return
+    if not (type_in[conid] & ContactType.CONSTRAINT):
+      return
+    condim = condim_in[conid]
+    if dimid > condim - 1:
+      return
+    pos = dist_in[conid] - includemargin_in[conid]
+    if pos <= 0.0:
+      return
+    efcid = contact_efc_address_in[conid, dimid]
+    if efcid < 0:
+      return
+    worldid = worldid_in[conid]
+    inert = False
+    if wp.static(null_rows):
+      inert = True
+    elif dimid > 0:
+      if wp.static(friction_mode == 1):
+        inert = True
+      elif wp.static(friction_mode == 2):
+        efcid0 = contact_efc_address_in[conid, 0]
+        timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+        # the normal row's velocity (efc.vel of dim 0 = J_n qvel, written by the update kernel from Jqvel)
+        v_n = efc_Jqvel_out[worldid, efcid0]
+        inert = pos + timestep * v_n >= 0.0
+    if not inert:
+      return
+    if wp.static(is_sparse):
+      rowadr = efc_J_rowadr_in[worldid, efcid]
+      for k in range(efc_J_rownnz_in[worldid, efcid]):
+        efc_J_out[worldid, 0, rowadr + k] = 0.0
+    else:
+      for k in range(nv_padded):
+        efc_J_out[worldid, efcid, k] = 0.0
+    efc_vel_out[worldid, efcid] = 0.0
+    efc_aref_out[worldid, efcid] = 0.0
+
+  return kernel
+
+
+@cache_kernel
 def _efc_contact_update_flex(cone_type: types.ConeType, flg_adhesion: bool = False):
   IS_ELLIPTIC = cone_type == types.ConeType.ELLIPTIC
 
@@ -5968,5 +6052,30 @@ def make_constraint(m: types.Model, d: types.Data):
             d.efc.vel,
             d.efc.aref,
             d.efc.frictionloss,
+          ],
+        )
+
+      if (SPECULATIVE_GAP and m.opt.cone == types.ConeType.ELLIPTIC and (SPECULATIVE_NULL or SPECULATIVE_FRICTION != "cone")):
+        wp.launch(
+          _efc_contact_spec_gate(m.is_sparse, {"cone": 0, "none": 1, "live": 2}[SPECULATIVE_FRICTION], SPECULATIVE_NULL),
+          dim=(d.naconmax, nmaxdim),
+          inputs=[
+            m.opt.timestep,
+            d.nacon,
+            d.contact.efc_address,
+            d.efc.J_rownnz,
+            d.efc.J_rowadr,
+            d.contact.dist,
+            d.contact.dim,
+            d.contact.includemargin,
+            d.contact.worldid,
+            d.contact.type,
+            d.efc.J.shape[2],
+          ],
+          outputs=[
+            d.efc.J,
+            d.efc.Jqvel,
+            d.efc.vel,
+            d.efc.aref,
           ],
         )
