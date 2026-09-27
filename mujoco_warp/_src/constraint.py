@@ -2830,8 +2830,10 @@ def _efc_contact_init(cone_type: types.ConeType, is_sparse: bool, newton: bool, 
     if wp.static(SPECULATIVE_GAP):
       # MetalSim prototype (MJW_SPECULATIVE_GAP=1): every detected contact (dist < margin + gap) gets constraint rows, so
       # contacts inside the gap are speculative rows with pos = dist - margin > 0; the unilateral soft constraint acts on
-      # them only when the approach velocity makes a_ref positive (-b v > k imp pos), like PhysX's contact offset
-      active = True
+      # them only when the approach velocity makes a_ref positive (-b v > k imp pos), like PhysX's contact offset.
+      # A contact at exactly dist == margin stays inactive, as in MuJoCo (C's exclude = 1; such contacts only arrive via
+      # put_data, e.g. keyframes resting at dist 0: without this the jdotv tests got rows MuJoCo does not have)
+      active = active or (pos > 0.0)
 
     if not active:
       return
@@ -2971,8 +2973,10 @@ def _efc_contact_init_flex(cone_type: types.ConeType, is_sparse: bool, newton: b
     if wp.static(SPECULATIVE_GAP):
       # MetalSim prototype (MJW_SPECULATIVE_GAP=1): every detected contact (dist < margin + gap) gets constraint rows, so
       # contacts inside the gap are speculative rows with pos = dist - margin > 0; the unilateral soft constraint acts on
-      # them only when the approach velocity makes a_ref positive (-b v > k imp pos), like PhysX's contact offset
-      active = True
+      # them only when the approach velocity makes a_ref positive (-b v > k imp pos), like PhysX's contact offset.
+      # A contact at exactly dist == margin stays inactive, as in MuJoCo (C's exclude = 1; such contacts only arrive via
+      # put_data, e.g. keyframes resting at dist 0: without this the jdotv tests got rows MuJoCo does not have)
+      active = active or (pos > 0.0)
 
     if not active:
       return
