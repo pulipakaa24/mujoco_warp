@@ -482,6 +482,41 @@ class SensorTest(parameterized.TestCase):
     mjw.energy_vel(m, d)
     _assert_eq(d.energy.numpy()[0][1], mjd.energy[1], "kinetic energy")
 
+  def test_energy_nv0(self):
+    """Energy of a model without degrees of freedom: zero kinetic energy, as in MuJoCo C."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option>
+          <flag energy="enable"/>
+        </option>
+        <worldbody>
+          <body pos="0 0 1">
+            <geom type="sphere" size=".1"/>
+          </body>
+        </worldbody>
+      </mujoco>
+      """
+    )
+    self.assertEqual(m.nv, 0)
+
+    d.energy.fill_(wp.inf)
+
+    mujoco.mj_energyPos(mjm, mjd)
+    mjw.energy_pos(m, d)
+    _assert_eq(d.energy.numpy()[0][0], mjd.energy[0], "potential energy")
+
+    mujoco.mj_energyVel(mjm, mjd)
+    mjw.energy_vel(m, d)
+    _assert_eq(d.energy.numpy()[0][1], 0.0, "kinetic energy")
+    _assert_eq(d.energy.numpy()[0][1], mjd.energy[1], "kinetic energy")
+
+    # through forward with the energy flag enabled
+    d.energy.fill_(wp.inf)
+    mujoco.mj_forward(mjm, mjd)
+    mjw.forward(m, d)
+    _assert_eq(d.energy.numpy()[0], mjd.energy, "energy")
+
   @parameterized.parameters(
     'type="capsule" size=".1 .1" euler="0 89 89"',
     'type="box" size=".1 .11 .12" euler=".02 .05 .1"',

@@ -3050,6 +3050,15 @@ def energy_pos(m: Model, d: Data):
     # TODO(team): flex
 
 
+@wp.kernel
+def _energy_vel_zero(
+  # Data out:
+  energy_out: wp.array[wp.vec2],
+):
+  worldid = wp.tid()
+  energy_out[worldid][1] = 0.0
+
+
 @cache_kernel
 def _energy_vel_kinetic(nv: int):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
@@ -3080,6 +3089,12 @@ def _energy_vel_kinetic(nv: int):
 def energy_vel(m: Model, d: Data):
   """Velocity-dependent energy (kinetic)."""
   # kinetic energy: 0.5 * qvel.T @ M @ qvel
+
+  if m.nv == 0:
+    # no degrees of freedom: zero kinetic energy, as in MuJoCo C (no mul_m, and the tiled kernel cannot be built with
+    # zero-length tiles)
+    wp.launch(_energy_vel_zero, dim=d.nworld, outputs=[d.energy])
+    return
 
   # M @ qvel
   mv = wp.zeros((d.nworld, m.nv), dtype=float)
