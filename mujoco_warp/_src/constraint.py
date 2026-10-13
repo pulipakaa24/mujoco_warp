@@ -266,7 +266,9 @@ def _equality_connect(is_sparse: bool, newton: bool):
     wp.atomic_add(ne_out, worldid, 3)
     efcid = wp.atomic_add(nefc_out, worldid, 3)
 
-    if efcid >= njmax_in - 3:
+    # the block is rows efcid .. efcid + 2: it fits when efcid + 3 <= njmax (a block ending exactly at njmax is kept;
+    # nefc > njmax then flags the overflow of any block that does not fit)
+    if efcid + 3 > njmax_in:
       return
 
     if wp.static(is_sparse and newton):
@@ -1115,7 +1117,8 @@ def _equality_weld(is_sparse: bool, newton: bool):
     wp.atomic_add(ne_out, worldid, 6)
     efcid = wp.atomic_add(nefc_out, worldid, 6)
 
-    if efcid >= njmax_in - 6:
+    # rows efcid .. efcid + 5: fits when efcid + 6 <= njmax (see the connect block above)
+    if efcid + 6 > njmax_in:
       return
 
     if wp.static(is_sparse and newton):

@@ -190,6 +190,40 @@ class ConstraintTest(parameterized.TestCase):
       _assert_efc_eq(mjm, m, d, mjd, mjd.nefc, "efc", m.nv)
 
   @parameterized.parameters(
+    *itertools.product(
+      (("connect", "<connect body1='a' anchor='0 0 0'/>", 3), ("weld", "<weld body1='a'/>", 6)),
+      (mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+    )
+  )
+  def test_equality_block_ending_at_njmax(self, eq, jacobian):
+    """An equality block that ends exactly at njmax is written (it fits), not dropped without an overflow flag."""
+    name, eqxml, nrow = eq
+    xml = f"""
+    <mujoco>
+      <worldbody>
+        <body name="a" pos="0 0 1">
+          <freejoint/>
+          <geom type="sphere" size="0.1" contype="0" conaffinity="0"/>
+        </body>
+      </worldbody>
+      <equality>{eqxml}</equality>
+    </mujoco>
+    """
+    mjm, mjd, m, d = test_data.fixture(xml=xml, njmax=nrow, overrides={"opt.jacobian": jacobian})
+    self.assertEqual(mjd.nefc, nrow, name)
+    for arr in (d.ne, d.nefc, d.efc.type):
+      arr.fill_(-1)
+    for arr in (d.efc.J, d.efc.D, d.efc.vel, d.efc.aref, d.efc.pos, d.efc.margin):
+      arr.fill_(wp.nan)
+    d.overflow.zero_()
+
+    mjw.make_constraint(m, d)
+
+    _assert_eq(d.ne.numpy()[0], nrow, "ne")
+    _assert_eq(d.nefc.numpy()[0], nrow, "nefc")
+    _assert_efc_eq(mjm, m, d, mjd, nrow, f"efc {name}", m.nv)
+
+  @parameterized.parameters(
     mujoco.mjtJacobian.mjJAC_DENSE,
     mujoco.mjtJacobian.mjJAC_SPARSE,
   )
