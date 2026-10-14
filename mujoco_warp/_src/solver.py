@@ -2187,6 +2187,12 @@ def _fuse_update(m: types.Model, ctx) -> bool:
   dev = wp.get_device()
   if not (_METAL_FUSE_UPDATE and (getattr(dev, "is_metal", False) or (_METAL_FUSE_UPDATE_CPU and dev.is_cpu))):
     return False
+  # Warp's deterministic mode: the unfused launches. The fused kernel zeroes and reads back its own change counter
+  # within the launch (suppressed in the deterministic counting pass), and its deterministic plan at 1,024 worlds
+  # under capture asks for more than 2^31 scratch elements; unfused costs nothing measurable there (MetalSim #29).
+  modes = getattr(wp, "DeterministicMode", None)
+  if modes is not None and getattr(wp.config, "deterministic", modes.NOT_GUARANTEED) != modes.NOT_GUARANTEED:
+    return False
   if m.is_sparse or _sparse_compact(ctx):
     return False
   if m.opt.cone != types.ConeType.ELLIPTIC:
