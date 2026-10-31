@@ -46,6 +46,21 @@ HFIELD_PLANE_CONTACTS = True
 # footprint falls outside the triangle (a 2 m box on a 0.2 m heightfield: upstream's test_hfield_maxconpair, 0
 # contacts instead of 4); with False (default since 2026-09-25) they use upstream's GJK/EPA against the prism.
 HFIELD_PLANE_CONTACTS_PRIMITIVES = False
+# MetalSim: heightfield contact selection (contacts 1-3 of a pair). Upstream ends the selection when the next candidate
+# is within 1 mm of the deepest one, by position only; a 5 mm sphere in a crease touches two faces at points 0.4 mm
+# apart (p5 of the g1_bumps tile's two-contact sets), so it lost the second face. A candidate is now skipped only when
+# it duplicates a selected contact: within HFIELD_DUP_DIST and with a normal within acos(HFIELD_DUP_COS) (the same
+# triangle feature reached from two prisms, e.g. a shared edge; float32 witness noise is ~2e-5 m on a 200 m field).
+# HFIELD_SELECT_DEDUP False restores upstream's rule.
+HFIELD_SELECT_DEDUP = True
+# MetalSim: heightfield prisms are built relative to the other geom's position (in the heightfield frame), so GJK/EPA
+# and the plane test run on small numbers. In absolute heightfield coordinates float32 witness points carry ~1e-5 m of
+# noise 100 m from the centre (MetalSim's rough terrain is 200 m across), ~0.3 deg on a 5 mm sphere's normal, which the
+# duplicate test cannot tell from a second face. Upstream's CCD kernel shifts its origin the same way ("translation
+# invariance"). False keeps the absolute frame.
+HFIELD_LOCAL_ORIGIN = True
+HFIELD_DUP_DIST = 1.0e-4
+HFIELD_DUP_COS = 0.99999962  # cos(0.05 deg)
 from mujoco_warp._src.math import upper_trid_index
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
 from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
@@ -370,6 +385,12 @@ def ccd_hfield_kernel_builder(
     geom1.pos = wp.vec3(0.0, 0.0, 0.0)
     geom1.rot = wp.identity(n=3, dtype=float)
 
+    # MetalSim: local origin at geom2 (HFIELD_LOCAL_ORIGIN); prism vertices and contacts are relative to org
+    org = wp.vec3(0.0)
+    if wp.static(HFIELD_LOCAL_ORIGIN):
+      org = geom2.pos
+      geom2.pos = wp.vec3(0.0)
+
     # see MuJoCo mjc_ConvexHField
     geom1_dataid = geom_dataid[worldid % geom_dataid.shape[0], g1]
 
@@ -390,12 +411,17 @@ def ccd_hfield_kernel_builder(
     dy = (2.0 * size[1]) / float(nrow - 1)
     dr = wp.vec2i(1, 0)
 
+    # subgrid corner relative to org (one rounding for the whole subgrid)
+    x0 = dx * float(cmin) - size[0] - org[0]
+    y0 = dy * float(rmin) - size[1] - org[1]
+    zmin = zmin - org[2]
+
     prism = mat63()
 
     # set zbottom value using base size
-    prism[0, 2] = -size[3]
-    prism[1, 2] = -size[3]
-    prism[2, 2] = -size[3]
+    prism[0, 2] = -size[3] - org[2]
+    prism[1, 2] = -size[3] - org[2]
+    prism[2, 2] = -size[3] - org[2]
 
     adr = hfield_adr[geom1_dataid]
 
@@ -407,8 +433,11 @@ def ccd_hfield_kernel_builder(
     min_pos = wp.vec3(MJ_MAXVAL, MJ_MAXVAL, MJ_MAXVAL)
     min_id = int(-1)
 
-    # geom1 margin added to z-axis of hfield prism top points below
-    geom2.margin = margin
+    # geom1 margin added to z-axis of hfield prism top points below. MetalSim: margin + gap, as MuJoCo C (its
+    # mjc_ConvexHField receives margin + gap, raises the prism top by it and inflates geom2 by half of it); the
+    # reported dist is therefore C's: separation - 1.5 * (margin + gap)
+    hfmargin = margin + gap
+    geom2.margin = hfmargin
 
     # EPA memory
     epa_vert = epa_vert_in[ccdid]
@@ -425,9 +454,9 @@ def ccd_hfield_kernel_builder(
     for r in range(rmin, rmax):
       # pre-initialize first 2 vertices
       for init_i in range(2):
-        x = dx * float(cmin) - size[0]
-        y = dy * float(r + dr[init_i]) - size[1]
-        z = hfield_data[adr + (r + dr[init_i]) * ncol + cmin] * size[2] + margin
+        x = x0
+        y = dy * float(r + dr[init_i] - rmin) + y0
+        z = hfield_data[adr + (r + dr[init_i]) * ncol + cmin] * size[2] + hfmargin - org[2]
 
         prism[0] = prism[1]
         prism[1] = prism[2]
@@ -455,9 +484,9 @@ def ccd_hfield_kernel_builder(
             continue
 
           # add vert
-          x = dx * float(c) - size[0]
-          y = dy * float(r + dr[i]) - size[1]
-          z = hfield_data[adr + (r + dr[i]) * ncol + c] * size[2] + margin
+          x = dx * float(c - cmin) + x0
+          y = dy * float(r + dr[i] - rmin) + y0
+          z = hfield_data[adr + (r + dr[i]) * ncol + c] * size[2] + hfmargin - org[2]
 
           prism[0] = prism[1]
           prism[1] = prism[2]
@@ -497,6 +526,7 @@ def ccd_hfield_kernel_builder(
             tn = tn / tn_len
             best_depth = float(0.0)
             best_p = wp.vec3(0.0, 0.0, 0.0)
+            infl = 0.5 * hfmargin
             nvert = geom2.vertnum
             if geomtype2 != int(GeomType.MESH) or nvert > 256:
               nvert = 1
@@ -505,7 +535,7 @@ def ccd_hfield_kernel_builder(
                 pv = geom2.rot @ geom2.vert[geom2.vertadr + k] + geom2.pos
               else:
                 pv = support(geom2, geomtype2, -tn).point
-              depth = wp.dot(pv - v0, tn)
+              depth = wp.dot(pv - v0, tn) - infl
               if depth >= best_depth:
                 continue
               # footprint test: xy of pv inside the triangle's xy projection (small tolerance so
@@ -521,7 +551,7 @@ def ccd_hfield_kernel_builder(
               continue
             dist = best_depth
             hfield_contact_dist[count] = dist
-            pos = hf_mat @ (best_p - 0.5 * dist * tn) + hf_pos
+            pos = hf_mat @ (best_p - (0.5 * dist + infl) * tn + org) + hf_pos
             hfield_contact_pos[count, 0] = pos[0]
             hfield_contact_pos[count, 1] = pos[1]
             hfield_contact_pos[count, 2] = pos[2]
@@ -555,14 +585,14 @@ def ccd_hfield_kernel_builder(
               overflow_out,
             )
 
-            if ncontact == 0:
+            if ncontact == 0 or dist >= 0.0:
               continue
 
             # cache contact information
             hfield_contact_dist[count] = dist
 
             # transform contact to global frame
-            pos_local = 0.5 * (w1 + w2)
+            pos_local = 0.5 * (w1 + w2) + org
             pos = hf_mat @ pos_local + hf_pos
             hfield_contact_pos[count, 0] = pos[0]
             hfield_contact_pos[count, 1] = pos[1]
@@ -583,6 +613,10 @@ def ccd_hfield_kernel_builder(
             min_id = count
 
           count += 1
+
+    # skip write when no prisms collide
+    if count == 0:
+      return
 
     # contact 0: minimum distance
     write_contact(
@@ -620,8 +654,94 @@ def ccd_hfield_kernel_builder(
       nacon_out,
     )
 
-    # TODO(team): routine for select subset of contacts
-    if wp.static(True):
+    # MetalSim: contacts 1-3 by upstream's spread rules (1: furthest from contact 0; 2: furthest from the line
+    # contact 0 - contact 1; 3: furthest from the other triangle edges), skipping only duplicates of a selected
+    # contact (HFIELD_DUP_DIST, HFIELD_DUP_COS) instead of stopping at the first candidate within 1 mm
+    if wp.static(HFIELD_SELECT_DEDUP):
+      sel1 = int(-1)
+      sel2 = int(-1)
+      pos1 = wp.vec3(0.0)
+      pos2 = wp.vec3(0.0)
+      nrm1 = wp.vec3(0.0)
+      nrm2 = wp.vec3(0.0)
+      for k in range(1, 4):
+        best = int(-1)
+        best_score = float(-1.0)
+        line01 = wp.cross(min_normal, min_pos - pos1)
+        line02 = wp.cross(min_normal, min_pos - pos2)
+        line12 = wp.cross(min_normal, pos1 - pos2)
+        for j in range(count):
+          if j == min_id or j == sel1 or j == sel2:
+            continue
+          pj = wp.vec3(hfield_contact_pos[j, 0], hfield_contact_pos[j, 1], hfield_contact_pos[j, 2])
+          nj = wp.vec3(hfield_contact_normal[j, 0], hfield_contact_normal[j, 1], hfield_contact_normal[j, 2])
+          dup = wp.length(pj - min_pos) < wp.static(HFIELD_DUP_DIST) and wp.dot(nj, min_normal) > wp.static(HFIELD_DUP_COS)
+          if k > 1:
+            dup = dup or (wp.length(pj - pos1) < wp.static(HFIELD_DUP_DIST) and wp.dot(nj, nrm1) > wp.static(HFIELD_DUP_COS))
+          if k > 2:
+            dup = dup or (wp.length(pj - pos2) < wp.static(HFIELD_DUP_DIST) and wp.dot(nj, nrm2) > wp.static(HFIELD_DUP_COS))
+          if dup:
+            continue
+          score = float(0.0)
+          if k == 1:
+            score = wp.length(pj - min_pos)
+          elif k == 2:
+            score = wp.abs(wp.dot(pj - min_pos, line01))
+          else:
+            score = wp.abs(wp.dot(pj - min_pos, line02)) + wp.abs(wp.dot(pos1 - pj, line12))
+          if score > best_score:
+            best = j
+            best_score = score
+
+        if best == -1:
+          return
+
+        pk = wp.vec3(hfield_contact_pos[best, 0], hfield_contact_pos[best, 1], hfield_contact_pos[best, 2])
+        nk = wp.vec3(hfield_contact_normal[best, 0], hfield_contact_normal[best, 1], hfield_contact_normal[best, 2])
+        write_contact(
+          naconmax_in,
+          k,
+          hfield_contact_dist[best],
+          pk,
+          make_frame(nk),
+          margin,
+          gap,
+          condim,
+          friction,
+          solref,
+          solreffriction,
+          solimp,
+          adhesion,
+          geoms,
+          collision_pairid,
+          worldid,
+          contact_dist_out,
+          contact_pos_out,
+          contact_frame_out,
+          contact_includemargin_out,
+          contact_friction_out,
+          contact_solref_out,
+          contact_solreffriction_out,
+          contact_solimp_out,
+          contact_dim_out,
+          contact_geom_out,
+          contact_efc_address_out,
+          contact_worldid_out,
+          contact_type_out,
+          contact_geomcollisionid_out,
+          contact_adhesion_out,
+          nacon_out,
+        )
+        if k == 1:
+          sel1 = best
+          pos1 = pk
+          nrm1 = nk
+        elif k == 2:
+          sel2 = best
+          pos2 = pk
+          nrm2 = nk
+    else:
+      # upstream's selection (TODO(team): routine for select subset of contacts)
       MIN_DIST_TO_NEXT_CONTACT = 1.0e-3
 
       # contact 1: furthest from minimum distance contact

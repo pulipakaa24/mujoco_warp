@@ -35,6 +35,14 @@ MINVAL2 = 1e-30
 MAXVAL = 1e15
 MAXVAL2 = 1e30
 
+# MetalSim: a heightfield prism is a plain convex polytope in _inflate and _epa_witness, as in MuJoCo C (its
+# engine_collision_gjk.c has no heightfield case; mjc_ConvexHField runs plain GJK/EPA per prism). Upstream (#928,
+# f2f7957) replaces any result whose prism feature spans top and bottom vertices (a side wall) by a vertical contact
+# against the top triangle with dist = -|x1 - x2|: a penetration whatever the real separation (a 5 mm sphere 8.6 mm
+# clear of a prism came back 25.6 mm deep with normal (0, 0, 1); MetalSim docs/research/hfield_contacts_2026-10-31.md).
+# False restores upstream's override.
+HFIELD_PRISM_POLYTOPE = True
+
 # polytope minimal interior distance to origin
 MIN_DIST2 = 1e-10
 MIN_DIST3 = 1e-10
@@ -993,7 +1001,7 @@ def _epa_witness(
   i1 = pt.vert_index[2 * face[0]]
   i2 = pt.vert_index[2 * face[1]]
   i3 = pt.vert_index[2 * face[2]]
-  if geomtype1 == GeomType.HFIELD and (i1 != i2 or i1 != i3):
+  if wp.static(not HFIELD_PRISM_POLYTOPE) and geomtype1 == GeomType.HFIELD and (i1 != i2 or i1 != i3):
     # TODO(kbayes): Fix case where geom2 is near bottom of height field or "extreme" prism heights
     n = wp.vec3(0.0, 0.0, 1.0)
 
@@ -2459,7 +2467,7 @@ def _inflate(
   x1 = result.x1
   x2 = result.x2
 
-  if geomtype1 == GeomType.HFIELD:
+  if wp.static(not HFIELD_PRISM_POLYTOPE) and geomtype1 == GeomType.HFIELD:
     v = result.simplex_index1[0]
     is_side = bool(False)
     for i in range(result.dim):
