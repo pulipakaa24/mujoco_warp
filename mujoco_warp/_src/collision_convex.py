@@ -38,8 +38,14 @@ from mujoco_warp._src.collision_primitive import geom_collision_pair
 from mujoco_warp._src.collision_primitive import write_contact
 from mujoco_warp._src.math import make_frame
 
-# MetalSim: heightfield contacts from the prism top plane (see ccd_hfield_kernel)
-HFIELD_PLANE_CONTACTS = True
+# MetalSim: heightfield contacts from the prism top plane (see ccd_hfield_kernel). Off by default since 2026-10-31:
+# with the prism treated as a plain polytope (collision_gjk.HFIELD_PRISM_POLYTOPE, unique prism vertex indices) GJK/EPA
+# per prism is exact for meshes too, while the plane path misses every contact whose deepest point is a terrain vertex
+# or edge inside the mesh (Isaac's G1 foot on the g1_bumps tile: no contact in 178 of 1000 placements that touch,
+# 9.6 % of normals > 10 deg off; GJK/EPA: 0 and 0 %; MetalSim docs/research/hfield_contacts_2026-10-31.md). True
+# restores it (meshes of at most 256 vertices). Warp's deterministic mode keeps the plane path for meshes regardless:
+# the GJK/EPA path is not repeatable there (convex_narrowphase).
+HFIELD_PLANE_CONTACTS = False
 # Which geoms take the per-triangle plane path against a heightfield: meshes of at most 256 vertices always (the G1
 # feet; every vertex is tested against the triangle's column). Primitives (sphere, capsule, box, ...) only have their
 # single support point along the triangle normal available, which misses the contact whenever that point's
@@ -194,8 +200,13 @@ def ccd_hfield_kernel_builder(
   epa_iterations: int,
   geomgeomid: int,
   warn_overflow: int,
+  plane_contacts: bool = False,
 ):
-  """Kernel builder for heightfield CCD collisions (no multiccd args)."""
+  """Kernel builder for heightfield CCD collisions (no multiccd args).
+
+  plane_contacts: MetalSim's per-triangle plane path for meshes of at most 256 vertices (and primitives with
+  HFIELD_PLANE_CONTACTS_PRIMITIVES); convex_narrowphase passes HFIELD_PLANE_CONTACTS or Warp's deterministic mode.
+  """
 
   # runs convex collision on a set of geom pairs to recover contact info
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
@@ -505,7 +516,7 @@ def ccd_hfield_kernel_builder(
 
           geom1.polyvert = prism
 
-          plane_path = wp.static(HFIELD_PLANE_CONTACTS) and (
+          plane_path = wp.static(plane_contacts) and (
             wp.static(HFIELD_PLANE_CONTACTS_PRIMITIVES) or (geomtype2 == int(GeomType.MESH) and geom2.vertnum <= 256)
           )
           if plane_path:
@@ -1918,14 +1929,16 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
         # ccd_det_kernels_builder and is not split; only its plane path is repeatable. Meshes take the plane path
         # when they have at most 256 vertices, a per-geom runtime test (the caller checks it on the host model).
         other = g2 if g1 == GeomType.HFIELD else g1
-        plane = HFIELD_PLANE_CONTACTS and (HFIELD_PLANE_CONTACTS_PRIMITIVES or other == GeomType.MESH)
+        plane = HFIELD_PLANE_CONTACTS_PRIMITIVES or other == GeomType.MESH
         if not plane:
           raise NotImplementedError(
             f"deterministic mode: heightfield-{GeomType(other).name.lower()} contacts go through GJK/EPA, which is not "
             "repeatable in Warp's deterministic mode (only meshes of at most 256 vertices take the repeatable plane path)"
           )
       wp.launch(
-        ccd_hfield_kernel_builder(g1, g2, m.opt.ccd_iterations, epa_iterations, geomgeomid, int(m.opt.warn_overflow)),
+        ccd_hfield_kernel_builder(
+          g1, g2, m.opt.ccd_iterations, epa_iterations, geomgeomid, int(m.opt.warn_overflow), HFIELD_PLANE_CONTACTS or det_split
+        ),
         dim=d.naconmax,
         inputs=[
           m.opt.ccd_tolerance,

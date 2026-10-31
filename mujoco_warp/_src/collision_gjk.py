@@ -210,13 +210,22 @@ def support(geom: Geom, geomtype: int, dir: wp.vec3) -> SupportPoint:
   elif geomtype == GeomType.HFIELD:
     max_dist = float(FLOAT_MIN)
     # TODO(kbayes): Support edge prisms
-    sp.vertex_index = wp.where(dir[2] < 0.0, -2, -3)
+    imax = int(0)
     for i in range(6):
       vert = geom.polyvert[i]
       dist = wp.dot(vert, dir)
       if dist > max_dist:
         max_dist = dist
         sp.point = vert
+        imax = i
+    if wp.static(HFIELD_PRISM_POLYTOPE):
+      # MetalSim: one index per prism vertex. EPA on discrete pairs (box, mesh) stops when a support point repeats an
+      # (index1, index2) pair already in the polytope; with -2 / -3 for all six vertices it stopped early and returned
+      # depths of 1-4 mm for a box 9 mm into a prism (MuJoCo C's mjc_prism_support never sets vertindex: the same
+      # defect, engine_collision_gjk.c epa() "repeated support point")
+      sp.vertex_index = imax
+    else:
+      sp.vertex_index = wp.where(dir[2] < 0.0, -2, -3)
   elif geomtype == GeomType.TRIANGLE:
     t1 = geom.rot[0, :]
     t2 = geom.rot[1, :]
