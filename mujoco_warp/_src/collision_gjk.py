@@ -42,6 +42,10 @@ MAXVAL2 = 1e30
 # against the top triangle with dist = -|x1 - x2|: a penetration whatever the real separation (a 5 mm sphere 8.6 mm
 # clear of a prism came back 25.6 mm deep with normal (0, 0, 1); MetalSim docs/research/hfield_contacts_2026-10-31.md).
 # False restores upstream's override.
+# This flag and HFIELD_MARGIN_SHRINK are read by wp.static() when the kernels are defined, that is
+# when this module is imported (Warp's code_generation.rst: "The expression is evaluated immediately
+# at the time of kernel definition"). Change them by editing this file: assigning
+# collision_gjk.HFIELD_... = False after import has no effect.
 HFIELD_PRISM_POLYTOPE = True
 # MetalSim: a heightfield prism pair with a margin (HFIELD_TRUE_DISTANCE: prism and geom each
 # inflated by half of margin + gap) runs as MuJoCo C's mjc_ccd runs any pair with a margin ("special
@@ -52,7 +56,10 @@ HFIELD_PRISM_POLYTOPE = True
 # to the tolerance (up to ccd_iterations iterations): Isaac Lab 3.0's 1 cm geom gap made the G1's
 # rough terrain contacts about 2x costlier and filled EPA's horizon. Upstream MuJoCo Warp does the
 # same for non-heightfield pairs (gdm/main 23efc9a, has_non_hfield_margin). No effect at margin =
-# gap = 0. False: every margin case on EPA.
+# gap = 0. False (edit this file; see HFIELD_PRISM_POLYTOPE): every margin case on EPA. Only with
+# HFIELD_PRISM_POLYTOPE: without it, _inflate's side-wall override (written for upstream's sphere
+# and capsule shrink, it takes the witness point as a support direction) would take the shrunk
+# prism pairs, so HFIELD_PRISM_POLYTOPE = False also turns the shrink off (upstream's behaviour).
 HFIELD_MARGIN_SHRINK = True
 
 # polytope minimal interior distance to origin
@@ -2688,8 +2695,13 @@ def gjk_phase(
   is_discrete = _discrete_geoms(geomtype1, geomtype2) and (geom1.margin == 0.0 and geom2.margin == 0.0)
 
   # MetalSim: heightfield prism pairs with a margin shrink to the underlying geoms
-  # (HFIELD_MARGIN_SHRINK)
-  shrink = wp.static(HFIELD_MARGIN_SHRINK) and geomtype1 == GeomType.HFIELD and (orig_margin1 > 0.0 or orig_margin2 > 0.0)
+  # (HFIELD_MARGIN_SHRINK; only with HFIELD_PRISM_POLYTOPE, as _inflate's side-wall override is not
+  # meant for them, and upstream excludes heightfields: has_non_hfield_margin)
+  shrink = (
+    wp.static(HFIELD_MARGIN_SHRINK and HFIELD_PRISM_POLYTOPE)
+    and geomtype1 == GeomType.HFIELD
+    and (orig_margin1 > 0.0 or orig_margin2 > 0.0)
+  )
 
   # special handling for sphere and capsule (shrink to point and line respectively)
   if geomtype1 == GeomType.SPHERE or geomtype1 == GeomType.CAPSULE:
