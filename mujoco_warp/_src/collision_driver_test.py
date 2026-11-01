@@ -1119,6 +1119,31 @@ class CollisionTest(parameterized.TestCase):
     np.testing.assert_allclose(dist[i], 0.015, atol=1e-6)
     np.testing.assert_allclose(pos[i, 2], 0.0075, atol=1e-6)
 
+  def test_hfield_mesh_gap_distance(self):
+    """Box mesh corner 4 mm above a flat heightfield, gap 0.01 per geom: dist is the separation.
+
+    Isaac Lab 3.0's G1 setting; GJK on the uninflated shapes (HFIELD_MARGIN_SHRINK, as MuJoCo C's
+    mjc_ccd) gives it exactly, EPA on the inflated shapes only to its tolerance.
+    """
+    dist, normal, _ = self._hfield_contacts("""
+    <mujoco>
+      <asset>
+        <hfield name="h" nrow="11" ncol="11" size=".5 .5 .1 .1"/>
+        <mesh name="b" vertex="-.05 -.03 -.02  .05 -.03 -.02  -.05 .03 -.02  .05 .03 -.02
+                               -.05 -.03  .02  .05 -.03  .02  -.05 .03  .02  .05 .03  .02"/>
+      </asset>
+      <worldbody>
+        <geom type="hfield" hfield="h" gap=".01"/>
+        <body><freejoint/><geom type="mesh" mesh="b" gap=".01"/></body>
+      </worldbody>
+      <keyframe><key qpos=".0501 .0423 .035326693 .943714364 .189307857 .038134576 .268535823"/></keyframe>
+    </mujoco>
+    """)
+    i = np.argmin(dist)
+    # EPA on the inflated shapes (HFIELD_MARGIN_SHRINK False) returned 4.000172 mm here
+    np.testing.assert_allclose(dist[i], 0.004, atol=5e-8)
+    np.testing.assert_allclose(normal[i], [0.0, 0.0, 1.0], atol=1e-5)
+
   def test_min_friction(self):
     with self.assertWarns(UserWarning):
       _, _, _, d = test_data.fixture(

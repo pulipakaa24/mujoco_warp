@@ -43,6 +43,17 @@ MAXVAL2 = 1e30
 # clear of a prism came back 25.6 mm deep with normal (0, 0, 1); MetalSim docs/research/hfield_contacts_2026-10-31.md).
 # False restores upstream's override.
 HFIELD_PRISM_POLYTOPE = True
+# MetalSim: a heightfield prism pair with a margin (HFIELD_TRUE_DISTANCE: prism and geom each
+# inflated by half of margin + gap) runs as MuJoCo C's mjc_ccd runs any pair with a margin ("special
+# handling for sphere, capsule, and margin (shrink to underlying geom)"): GJK on the uninflated,
+# discrete shapes; if they are apart, the contact is that distance less the margins (_inflate) and
+# EPA does not run; only overlapping shapes go on to GJK + EPA on the inflated shapes. Without it
+# every prism within margin + gap of the geom ran EPA on the inflated (smooth, non-discrete) shapes
+# to the tolerance (up to ccd_iterations iterations): Isaac Lab 3.0's 1 cm geom gap made the G1's
+# rough terrain contacts about 2x costlier and filled EPA's horizon. Upstream MuJoCo Warp does the
+# same for non-heightfield pairs (gdm/main 23efc9a, has_non_hfield_margin). No effect at margin =
+# gap = 0. False: every margin case on EPA.
+HFIELD_MARGIN_SHRINK = True
 
 # polytope minimal interior distance to origin
 MIN_DIST2 = 1e-10
@@ -2664,22 +2675,35 @@ def gjk_phase(
   # determine if the geoms being tested are discrete
   is_discrete = _discrete_geoms(geomtype1, geomtype2) and (geom1.margin == 0.0 and geom2.margin == 0.0)
 
+  # MetalSim: heightfield prism pairs with a margin shrink to the underlying geoms
+  # (HFIELD_MARGIN_SHRINK)
+  shrink = wp.static(HFIELD_MARGIN_SHRINK) and geomtype1 == GeomType.HFIELD and (orig_margin1 > 0.0 or orig_margin2 > 0.0)
+
   # special handling for sphere and capsule (shrink to point and line respectively)
   if geomtype1 == GeomType.SPHERE or geomtype1 == GeomType.CAPSULE:
     size1 = geom1.size[0]
     full_margin1 = size1 + 0.5 * orig_margin1
     geom1.margin = 0.0
     geom1.size = wp.vec3(0.0, geom1.size[1], geom1.size[2])
+  elif shrink:
+    full_margin1 = 0.5 * orig_margin1
+    geom1.margin = 0.0
 
   if geomtype2 == GeomType.SPHERE or geomtype2 == GeomType.CAPSULE:
     size2 = geom2.size[0]
     full_margin2 = size2 + 0.5 * orig_margin2
     geom2.margin = 0.0
     geom2.size = wp.vec3(0.0, geom2.size[1], geom2.size[2])
+  elif shrink:
+    full_margin2 = 0.5 * orig_margin2
+    geom2.margin = 0.0
 
-  if size1 + size2 > 0.0:
+  if size1 + size2 > 0.0 or shrink:
     cutoff += full_margin1 + full_margin2
-    result = gjk(tolerance, gjk_iterations, geom1, geom2, x_1, x_2, geomtype1, geomtype2, cutoff, is_discrete)
+    shrunk_discrete = bool(is_discrete)
+    if shrink:
+      shrunk_discrete = _discrete_geoms(geomtype1, geomtype2) and geom1.margin == 0.0 and geom2.margin == 0.0
+    result = gjk(tolerance, gjk_iterations, geom1, geom2, x_1, x_2, geomtype1, geomtype2, cutoff, shrunk_discrete)
     geom1.index = result.index1
     geom2.index = result.index2
 
