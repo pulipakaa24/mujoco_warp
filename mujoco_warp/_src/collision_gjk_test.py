@@ -836,26 +836,28 @@ class GJKTest(parameterized.TestCase):
     self.assertFalse(overflow.numpy()[0] & OverflowType.EPA_HORIZON)
     self.assertAlmostEqual(dist, -0.00011578822, 6)
 
-    # same configuration with an undersized horizon buffer sets the overflow bit; MetalSim: EPA then
-    # returns its closest face (a lower bound on the depth) instead of no contact
-    overflow = wp.zeros(1, dtype=int)
-    dist, _, _, _ = _geom_dist(
-      m,
-      d,
-      0,
-      1,
-      multiccd=False,
-      pos1=pos1,
-      mat1=rot1,
-      pos2=pos2,
-      mat2=rot2,
-      horizon_size=4,
-      warn_overflow=False,
-      overflow_out=overflow,
-    )
-    self.assertTrue(overflow.numpy()[0] & OverflowType.EPA_HORIZON)
-    self.assertLess(dist, 0.0)
-    self.assertGreater(dist, -0.00011578822 - 1e-6)
+    # same configuration with an undersized horizon buffer sets the overflow bit and, as MuJoCo C
+    # (face = NULL when the horizon runs out of edges), returns no contact; MetalSim: the closest
+    # face returned here before was 4.6 % of the depth with a normal 90 deg off
+    for horizon_size in (3, 4):
+      overflow = wp.zeros(1, dtype=int)
+      dist, ncon, _, _ = _geom_dist(
+        m,
+        d,
+        0,
+        1,
+        multiccd=False,
+        pos1=pos1,
+        mat1=rot1,
+        pos2=pos2,
+        mat2=rot2,
+        horizon_size=horizon_size,
+        warn_overflow=False,
+        overflow_out=overflow,
+      )
+      self.assertTrue(overflow.numpy()[0] & OverflowType.EPA_HORIZON)
+      self.assertEqual(ncon, 0)
+      self.assertGreater(dist, 0.0)
 
   def test_epa_horizon_size(self):
     """MetalSim: the horizon buffer holds every edge of EPA's largest polytope (3 V - 6)."""

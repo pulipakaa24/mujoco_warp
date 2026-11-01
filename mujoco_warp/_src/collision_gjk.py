@@ -71,6 +71,11 @@ def epa_horizon_size(epa_iterations: int) -> int:
   most 3 V - 6 edges, and the horizon (deleted faces' edges, a shared edge removed when its second
   face is deleted) is a subset of them at every step. Upstream's fixed 24 (MJ_MAX_EPAHORIZON) can
   fill while the scan deletes faces in index order; MuJoCo C sizes it 24 + max(0, iterations - 35).
+
+  E = 3 V - 6 holds while the polytope is a simplicial sphere, and it stays one only because _epa
+  attaches new faces over a disk: a deleted region that is not a disk ends EPA without a contact.
+  If EPA were allowed to continue past such a region, as MuJoCo C does (it does not test for
+  one), the polytope would no longer be a sphere and this would not bound the horizon.
   """
   return max(MJ_MAX_EPAHORIZON, 3 * (5 + epa_iterations) - 6)
 
@@ -1586,8 +1591,14 @@ def _epa(
         pt.nhorizon = _add_edge(pt, face[2], face[0])
         connected = bool(True)
 
-    # the polytope cannot grow: return the closest face (a lower bound on the depth) instead of no
-    # contact
+    # the horizon cannot be built: no contact, as MuJoCo C's epa (face = NULL when horizon() runs
+    # out of edges). The closest face is not a usable answer here: with the horizon buffer forced
+    # to 4 edges in test_box_box_horizon it was 4.6 % of the depth with a normal 90 deg off. A
+    # connected region that is still not a disk (not seen at the derived buffer size) ends the same
+    # way: MuJoCo C does not test for it, but faces attached along a horizon that is not one loop
+    # do not close the polytope, and C's other unrecoverable cases (fewer than 3 horizon edges, a
+    # degenerate attached face) also return no contact. Without the region being a disk the
+    # polytope is no longer a sphere and epa_horizon_size does not bound the horizon.
     if connected and (pt.nhorizon == -1 or not _horizon_is_loop(pt)):
       if pt.nhorizon == -1:
         if warn_overflow:
@@ -1597,6 +1608,7 @@ def _epa(
             pt.horizon.shape[0],
           )
         wp.atomic_or(overflow_out, worldid, OverflowType.EPA_HORIZON)
+      idx = -1
       break
 
     # MetalSim: as MuJoCo C's epa ("out of memory for faces"), stop with the closest face when the
