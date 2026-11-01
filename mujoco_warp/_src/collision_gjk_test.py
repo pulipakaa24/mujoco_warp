@@ -24,6 +24,7 @@ from mujoco_warp import Model
 from mujoco_warp import test_data
 from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_gjk import ccd
+from mujoco_warp._src.collision_gjk import epa_horizon_size
 from mujoco_warp._src.collision_gjk import multicontact
 from mujoco_warp._src.collision_gjk import support
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
@@ -56,7 +57,7 @@ def _geom_dist(
   epa_face = wp.empty(6 + MJ_MAX_EPAFACES * m.opt.ccd_iterations, dtype=int)
   epa_pr = wp.empty(6 + MJ_MAX_EPAFACES * m.opt.ccd_iterations, dtype=wp.vec3)
   epa_norm2 = wp.empty(6 + MJ_MAX_EPAFACES * m.opt.ccd_iterations, dtype=float)
-  epa_horizon = wp.empty(MJ_MAX_EPAHORIZON if horizon_size is None else horizon_size, dtype=int)
+  epa_horizon = wp.empty(epa_horizon_size(m.opt.ccd_iterations) if horizon_size is None else horizon_size, dtype=int)
   if overflow_out is None:
     overflow_out = wp.zeros(1, dtype=int)
   multiccd_polygon = wp.empty(2 * npolygonmax, dtype=wp.vec3)
@@ -815,9 +816,10 @@ class GJKTest(parameterized.TestCase):
     dist, _, _, _ = _geom_dist(m, d, 0, 1, multiccd=False, pos1=pos1, mat1=rot1, pos2=pos2, mat2=rot2)
     self.assertAlmostEqual(dist, -0.00011578822, 6)  # dist = -0.00011579410621457821 - MJC 64 bit precision
 
-    # same configuration with an undersized horizon buffer sets the overflow bit
+    # MetalSim: the horizon grows as a connected region from the closest face (MuJoCo C's), so 5
+    # edges suffice here (the face-by-face scan needed 8)
     overflow = wp.zeros(1, dtype=int)
-    _geom_dist(
+    dist, _, _, _ = _geom_dist(
       m,
       d,
       0,
@@ -831,7 +833,34 @@ class GJKTest(parameterized.TestCase):
       warn_overflow=False,
       overflow_out=overflow,
     )
+    self.assertFalse(overflow.numpy()[0] & OverflowType.EPA_HORIZON)
+    self.assertAlmostEqual(dist, -0.00011578822, 6)
+
+    # same configuration with an undersized horizon buffer sets the overflow bit; MetalSim: EPA then
+    # returns its closest face (a lower bound on the depth) instead of no contact
+    overflow = wp.zeros(1, dtype=int)
+    dist, _, _, _ = _geom_dist(
+      m,
+      d,
+      0,
+      1,
+      multiccd=False,
+      pos1=pos1,
+      mat1=rot1,
+      pos2=pos2,
+      mat2=rot2,
+      horizon_size=4,
+      warn_overflow=False,
+      overflow_out=overflow,
+    )
     self.assertTrue(overflow.numpy()[0] & OverflowType.EPA_HORIZON)
+    self.assertLess(dist, 0.0)
+    self.assertGreater(dist, -0.00011578822 - 1e-6)
+
+  def test_epa_horizon_size(self):
+    """MetalSim: the horizon buffer holds every edge of EPA's largest polytope (3 V - 6)."""
+    self.assertEqual(epa_horizon_size(35), 114)
+    self.assertEqual(epa_horizon_size(1), MJ_MAX_EPAHORIZON)
 
   def test_box_box_rotation(self):
     """Test box-box with slight rotation which should give 4 contacts."""

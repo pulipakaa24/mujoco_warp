@@ -28,6 +28,7 @@ from mujoco_warp._src.collision_core import geom_collision_pair
 from mujoco_warp._src.collision_core import geom_collision_pair_from_types
 from mujoco_warp._src.collision_core import write_contact
 from mujoco_warp._src.collision_gjk import ccd
+from mujoco_warp._src.collision_gjk import epa_horizon_size
 from mujoco_warp._src.collision_gjk import epa_phase
 from mujoco_warp._src.collision_gjk import gjk_phase
 from mujoco_warp._src.collision_gjk import multicontact
@@ -76,7 +77,6 @@ HFIELD_LOCAL_ORIGIN = True
 HFIELD_TRUE_DISTANCE = True
 from mujoco_warp._src.math import upper_trid_index
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
-from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
 from mujoco_warp._src.types import MJ_MAXCONPAIR
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import Data
@@ -1918,7 +1918,7 @@ def convex_narrowphase(m: Model, d: Data, ctx: CollisionContext, collision_table
   # epa_norm2: epa_pr * epa_pr
   epa_norm2 = _ccd_scratch(d, "epa_norm2", (d.naccdmax, 6 + MJ_MAX_EPAFACES * epa_iterations), float)
   # epa_horizon: index pair (i j) of edges on horizon
-  epa_horizon = _ccd_scratch(d, "epa_horizon", (d.naccdmax, MJ_MAX_EPAHORIZON), int)
+  epa_horizon = _ccd_scratch(d, "epa_horizon", (d.naccdmax, epa_horizon_size(epa_iterations)), int)
 
   # Contact outputs
   contact_outputs = [

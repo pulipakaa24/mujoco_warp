@@ -25,9 +25,9 @@ from mujoco_warp._src.collision_core import Geom
 from mujoco_warp._src.collision_core import sap_binary_search
 from mujoco_warp._src.collision_core import sap_range
 from mujoco_warp._src.collision_gjk import ccd
+from mujoco_warp._src.collision_gjk import epa_horizon_size
 from mujoco_warp._src.math import make_frame
 from mujoco_warp._src.types import MJ_MAX_EPAFACES
-from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
 from mujoco_warp._src.types import MJ_MAXCONPAIR
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINMU
@@ -3226,7 +3226,7 @@ def _allocate_flex_workspace(m: Model, d: Data) -> FlexWorkspace:
     epa_face=wp.empty(shape=(capacity, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=int),
     epa_pr=wp.empty(shape=(capacity, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=wp.vec3),
     epa_norm2=wp.empty(shape=(capacity, 6 + MJ_MAX_EPAFACES * epa_iterations), dtype=float),
-    epa_horizon=wp.empty(shape=(capacity, MJ_MAX_EPAHORIZON), dtype=int),
+    epa_horizon=wp.empty(shape=(capacity, epa_horizon_size(epa_iterations)), dtype=int),
     nccd=nccd,
   )
 

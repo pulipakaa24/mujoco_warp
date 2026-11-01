@@ -19,6 +19,7 @@ from typing import Tuple
 import warp as wp
 
 from mujoco_warp._src.collision_core import Geom
+from mujoco_warp._src.types import MJ_MAX_EPAHORIZON
 from mujoco_warp._src.types import GeomType
 from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.types import mat43
@@ -51,6 +52,18 @@ MIN_DIST4 = 1e-17
 # minimal tolerance for EPA
 MIN_EPATOL = 1e-7
 
+
+def epa_horizon_size(epa_iterations: int) -> int:
+  """Size of the EPA horizon edge buffer (MetalSim).
+
+  EPA's polytope holds at most 5 + epa_iterations vertices (the vertex buffer's size), so it has at
+  most 3 V - 6 edges, and the horizon (deleted faces' edges, a shared edge removed when its second
+  face is deleted) is a subset of them at every step. Upstream's fixed 24 (MJ_MAX_EPAHORIZON) can
+  fill while the scan deletes faces in index order; MuJoCo C sizes it 24 + max(0, iterations - 35).
+  """
+  return max(MJ_MAX_EPAHORIZON, 3 * (5 + epa_iterations) - 6)
+
+
 FACE_TOL = wp.static(math.cos(0.0889))
 EDGE_TOL = wp.static(math.sin(0.0889))
 
@@ -63,6 +76,7 @@ INTERSECT_TOL = 0.0000003
 _FACE_DELETED_BIT = wp.constant(wp.uint32(0x80000000))
 _FACE_INVALID_BIT = wp.constant(wp.uint32(0x40000000))
 _FACE_INVALID_OR_DELETED_MASK = wp.constant(wp.uint32(0xC0000000))
+_FACE_NOT_DELETED_MASK = wp.constant(wp.uint32(0x7FFFFFFF))
 
 # Precomputed circle coordinates for 16-gon cylinder face approximation
 _CYLINDER_COS_16 = tuple(math.cos(i * math.pi / 8.0) for i in range(16))
@@ -983,6 +997,52 @@ def _add_edge(pt: Polytope, e1: int, e2: int) -> int:
 
 
 @wp.func
+def _shares_horizon_edge(pt: Polytope, face: wp.vec3i) -> bool:
+  """True if an edge of the face is on the horizon."""
+  e01 = (wp.min(face[0], face[1]) << 10) | wp.max(face[0], face[1])
+  e12 = (wp.min(face[1], face[2]) << 10) | wp.max(face[1], face[2])
+  e20 = (wp.min(face[2], face[0]) << 10) | wp.max(face[2], face[0])
+  for i in range(pt.nhorizon):
+    e = pt.horizon[i]
+    if e == e01 or e == e12 or e == e20:
+      return True
+  return False
+
+
+@wp.func
+def _horizon_is_loop(pt: Polytope) -> bool:
+  """True if the horizon edges form one simple closed loop.
+
+  MetalSim: the deleted faces are then a disk, as MuJoCo C's recursive horizon guarantees.
+  """
+  n = pt.nhorizon
+  if n < 3:
+    return False
+  e0 = _get_edge(pt.horizon[0])
+  start = e0[0]
+  cur = e0[1]
+  prev = int(0)
+  for step in range(1, n):
+    nxt = int(-1)
+    for j in range(n):
+      if j == prev:
+        continue
+      e = _get_edge(pt.horizon[j])
+      if e[0] == cur or e[1] == cur:
+        if nxt != -1:
+          return False  # vertex shared by more than two horizon edges (regions touching at a vertex)
+        nxt = j
+    if nxt == -1:
+      return False
+    e = _get_edge(pt.horizon[nxt])
+    cur = wp.where(e[0] == cur, e[1], e[0])
+    prev = nxt
+    if cur == start:
+      return step == n - 1  # closed after all n edges, else more than one loop
+  return False
+
+
+@wp.func
 def _epa_witness(
   pt: Polytope, geom1: Geom, geom2: Geom, geomtype1: int, geomtype2: int, face_idx: int
 ) -> Tuple[wp.vec3, wp.vec3, float]:
@@ -1355,6 +1415,12 @@ def _is_invalid_face(face: int) -> bool:
 
 
 @wp.func
+def _undelete_face(face: int) -> int:
+  """Return the face with the deleted bit cleared."""
+  return int(wp.uint32(face) & _FACE_NOT_DELETED_MASK)
+
+
+@wp.func
 def _epa(
   # In:
   tolerance: float,
@@ -1382,7 +1448,7 @@ def _epa(
   # so iterations must be cap to limit the number of generated vertices
   # (one new vertex per iteration)
   epa_iterations = wp.min(epa_iterations, 1000)
-  for _ in range(epa_iterations):
+  for k in range(epa_iterations):
     pidx = idx
     idx = int(-1)
     lower2 = float(FLOAT_MAX)
@@ -1449,27 +1515,83 @@ def _epa(
       break
 
     # compute horizon for w
-    for i in range(pt.nface):
-      if _is_face_deleted(pt.face[i]):
-        continue
-
-      if wp.dot(pt.face_pr[i], w) - pt.face_norm2[i] > 1e-10:
+    # MetalSim: the first pass below is the original scan: it tests every face on its own. When w
+    # lies (to rounding) on the planes of several faces, it can delete faces that are not connected
+    # to the closest face: two regions touching at a vertex, or a ring. The horizon is then not one
+    # loop, the faces attached to it do not close the polytope, and the edge list can grow past its
+    # buffer (EPA_HORIZON: the contact was dropped). MuJoCo C deletes only the visible faces
+    # connected to the closest face (horizon / horizonRec, recursion through face adjacency). When
+    # the scan's horizon is not one loop, the scan is undone (its faces carry `mark` in face_norm2,
+    # which is not read for deleted faces) and the deleted region grows from the closest face by
+    # further passes over the face list, each deleting a visible face only when it shares an edge
+    # with the region. A scan whose horizon is one loop deleted a disk around the closest face, the
+    # region MuJoCo C deletes, and is kept as it is (bitwise as before). Up to three faces, each
+    # sharing an edge with the ones deleted before it, always form a disk; the loop test is skipped
+    # then.
+    mark = -float(k + 1)
+    ndel = int(1)
+    nonadj = int(0)  # faces deleted by the scan that shared no edge with the faces deleted before them
+    connected = bool(False)
+    for _pass in range(pt.nface + 1):
+      grown = bool(False)
+      for i in range(pt.nface):
+        if _is_face_deleted(pt.face[i]):
+          continue
+        if not (wp.dot(pt.face_pr[i], w) - pt.face_norm2[i] > 1e-10):
+          continue
+        face = _get_face_verts(pt.face[i])
+        if connected and not _shares_horizon_edge(pt, face):
+          continue
         nvalid = wp.where(_is_invalid_face(pt.face[i]), nvalid, nvalid - 1)
         pt.face[i] = _delete_face(pt.face[i])
-        face = _get_face_verts(pt.face[i])
+        pt.face_norm2[i] = mark
+        ndel += 1
+        nprev = pt.nhorizon
         pt.nhorizon = _add_edge(pt, face[0], face[1])
         pt.nhorizon = _add_edge(pt, face[1], face[2])
         pt.nhorizon = _add_edge(pt, face[2], face[0])
+        grown = bool(True)
         if pt.nhorizon == -1:
-          if warn_overflow:
-            wp.printf(
-              "Warning: EPA horizon = %d isn't large enough.\n"
-              "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.EPA_HORIZON (or = 0 for all)\n",
-              pt.horizon.shape[0],
-            )
-          wp.atomic_or(overflow_out, worldid, OverflowType.EPA_HORIZON)
-          idx = -1
           break
+        if pt.nhorizon == nprev + 3:
+          nonadj += 1
+
+      if connected:
+        if not grown or pt.nhorizon == -1:
+          break
+      else:
+        if pt.nhorizon != -1 and not ((nonadj > 0 or ndel > 3) and not _horizon_is_loop(pt)):
+          break
+        # undo the scan; restart from the closest face
+        for i in range(pt.nface):
+          if _is_face_deleted(pt.face[i]) and pt.face_norm2[i] == mark:
+            pt.face[i] = _undelete_face(pt.face[i])
+            pt.face_norm2[i] = wp.dot(pt.face_pr[i], pt.face_pr[i])
+            nvalid = wp.where(_is_invalid_face(pt.face[i]), nvalid, nvalid + 1)
+        face = _get_face_verts(pt.face[idx])
+        pt.nhorizon = 0
+        pt.nhorizon = _add_edge(pt, face[0], face[1])
+        pt.nhorizon = _add_edge(pt, face[1], face[2])
+        pt.nhorizon = _add_edge(pt, face[2], face[0])
+        connected = bool(True)
+
+    # the polytope cannot grow: return the closest face (a lower bound on the depth) instead of no
+    # contact
+    if connected and (pt.nhorizon == -1 or not _horizon_is_loop(pt)):
+      if pt.nhorizon == -1:
+        if warn_overflow:
+          wp.printf(
+            "Warning: EPA horizon = %d isn't large enough.\n"
+            "To disable the print warning: m.opt.warn_overflow &= ~mjw.OverflowType.EPA_HORIZON (or = 0 for all)\n",
+            pt.horizon.shape[0],
+          )
+        wp.atomic_or(overflow_out, worldid, OverflowType.EPA_HORIZON)
+      break
+
+    # MetalSim: as MuJoCo C's epa ("out of memory for faces"), stop with the closest face when the
+    # new faces do not fit, instead of failing in _attach_face and returning no contact
+    if pt.nface + pt.nhorizon > pt.face.shape[0]:
+      break
 
     # insert w as new vertex and attach faces along the horizon
     for i in range(pt.nhorizon):
